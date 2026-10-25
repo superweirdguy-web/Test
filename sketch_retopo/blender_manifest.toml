@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "sketch_retopo"
+version = "1.0.0"
+name = "SketchRetopo"
+tagline = "Sketch-based quad retopology (port of SketchRetopo, SIGGRAPH 2013)"
+maintainer = "SketchRetopo for Blender contributors"
+type = "add-on"
+tags = ["Mesh", "Modeling"]
+
+blender_version_min = "4.2.0"
+
+# The original SketchRetopo source code is distributed by its authors for testing,
+# research and non-commercial use; see README.md.
+license = ["SPDX:LicenseRef-SketchRetopo-NonCommercial"]
+
+[permissions]
+files = "Import/export base meshes, XML sketches and retopo meshes"
