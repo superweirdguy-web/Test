@@ -175,6 +175,7 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         self._draw_error_reported = False
         self._last_autocmpl = 0.0
         self._hidden_base = None
+        self._hidden_outputs = {}
         self._h3d = bpy.types.SpaceView3D.draw_handler_add(_draw_view_cb, (self,), 'WINDOW', 'POST_VIEW')
         self._h2d = bpy.types.SpaceView3D.draw_handler_add(_draw_px_cb, (self,), 'WINDOW', 'POST_PIXEL')
         wm = context.window_manager
@@ -203,6 +204,7 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         except Exception:
             pass
         self._set_base_visibility(True)
+        self._restore_output_visibility()
         if sess is not None:
             sess.running = False
             sess.stop_requested = False
@@ -243,6 +245,29 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
                 self._hidden_base = None
         except Exception:
             pass
+
+    def _sync_output_visibility(self, context):
+        # The exported retopo object coincides with the live quads drawn by the session and would
+        # z-fight with them, so it is hidden while the session runs and shown again when it stops.
+        out = context.scene.sketch_retopo.output_object
+        if out is None or out.name in self._hidden_outputs or out.name == self.session.obj_name:
+            return
+        try:
+            self._hidden_outputs[out.name] = out.hide_get()
+            out.hide_set(True)
+        except Exception:
+            pass
+
+    def _restore_output_visibility(self):
+        for name, hidden in self._hidden_outputs.items():
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            try:
+                obj.hide_set(hidden)
+            except Exception:
+                pass
+        self._hidden_outputs.clear()
 
     def _sync_base_visibility(self):
         eng = self.session.engine
@@ -297,6 +322,7 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         if sess is None:
             return
         self._set_base_visibility(True)
+        self._restore_output_visibility()
         old = self.session
         old.running = False
         old.renderer = None
@@ -312,6 +338,7 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         eng = sess.engine
         settings = context.scene.sketch_retopo
         redraw = False
+        self._sync_output_visibility(context)
         if settings.turntable_mode:
             MayaCamera.turntable(self.rv3d, eng.configRender.turntable_speed)
             redraw = True
@@ -449,6 +476,7 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         self._flush_messages()
         self._process_requests(context)
         self._sync_base_visibility()
+        self._sync_output_visibility(context)
         _tag_redraw_all()
 
 
@@ -755,7 +783,10 @@ class SKETCHRETOPO_OT_export_mesh(bpy.types.Operator):
                 bpy.data.meshes.remove(old)
         if base is not None:
             out.matrix_world = base.matrix_world
-        self.report({'INFO'}, 'Retopo mesh: %d vertices, %d quads -> %s' % (len(verts), len(faces), out.name))
+        msg = 'Retopo mesh: %d vertices, %d quads -> %s' % (len(verts), len(faces), out.name)
+        if session.running_session() is not None:
+            msg += ' (shown when SketchRetopo stops)'
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 

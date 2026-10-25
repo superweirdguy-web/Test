@@ -67,7 +67,8 @@ def click(p, **mods):
 
 
 def key(k, **mods):
-    xy = to_window((0, -2, 0))
+    window, area, region, rv3d = view3d()
+    xy = (region.x + region.width // 2, region.y + region.height // 2)
     sim(k, 'PRESS', xy, **mods)
     sim(k, 'RELEASE', xy, **mods)
 
@@ -222,14 +223,30 @@ def steps():
     log('alt-rotate changed view:', tuple(rv3d.view_rotation) != rot0)
     screenshot('07_rotated')
 
+    # --- side views to show that the quads follow the surface
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.view3d.view_axis(type='RIGHT')
+    yield 0.1
+    screenshot('08_side')
+    key('SPACE')
+    yield 0.1
+    screenshot('09_side_quad_only')
+    key('SPACE')
+    yield 0.05
+
     # --- export and finish
     key('E', ctrl=True)
     yield 0.1
     out = bpy.context.scene.sketch_retopo.output_object
     log('export object', out.name if out else None, len(out.data.polygons) if out else 0)
+    # every exported vertex should lie on the unit sphere (plus the small projection offset)
+    radii = [(out.matrix_world @ v.co).length for v in out.data.vertices]
+    log('export radius min %.4f max %.4f' % (min(radii), max(radii)))
+    screenshot('10_side_after_export')
+    log('export object hidden while running', out.hide_get())
     key('ESC')
     yield 0.2
-    log('running after Esc', session.running_session() is not None)
+    log('running after Esc', session.running_session() is not None, 'export object hidden', out.hide_get())
 
 
 def main():

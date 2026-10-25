@@ -59,7 +59,7 @@ Most operations use the left mouse button.
 | `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) | Undo / redo |
 | `Ctrl+S` / `Ctrl+O` | Save / load the XML file |
 | `Ctrl+I` | Import a base mesh file |
-| `Ctrl+E` | Export the retopo mesh (creates/updates a mesh object) |
+| `Ctrl+E` | Export the retopo mesh (creates/updates a mesh object; it stays hidden while the session runs, because the session already draws the same quads, and appears when you press `Esc`) |
 | `Ctrl+F` | Toggle full screen |
 | `0` | Reset the camera rotation center to the base mesh center |
 | `6` | Turntable mode on/off |
