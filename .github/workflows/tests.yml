@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'   # the bpy wheel is built for one Python version
+      - name: Install system libraries used by bpy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libsm6 libice6 libx11-6 libxext6 libxfixes3 libxi6 \
+            libxrender1 libxkbcommon0 libvulkan1
+      - name: Patch generation (numpy only, before bpy is installed)
+        run: |
+          pip install numpy
+          python tests/test_patchgen.py
+      - name: Install bpy
+        run: pip install bpy==5.2.3
+      - name: Core sketching and editing modes
+        run: |
+          python tests/test_core_sketch.py
+          python tests/test_core_tools.py
+      - name: Blender integration
+        run: python tests/test_blender_addon.py

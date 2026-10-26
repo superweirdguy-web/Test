@@ -206,8 +206,12 @@ class BaseMesh:
         self.bvh = None
         self.bvh_faces = np.flatnonzero(~self.face_hidden)
         self._bvh_identity = len(self.bvh_faces) == len(self.tris)
-        if BVHTree is None or len(self.bvh_faces) == 0:
+        if len(self.bvh_faces) == 0:
             return
+        if BVHTree is None:
+            # without a BVH every ray cast would quietly miss, so fail loudly instead
+            raise ImportError('SketchRetopo needs mathutils for ray casting on the base mesh: '
+                              'run inside Blender or install the bpy package from PyPI')
         verts = self.verts.tolist()
         polys = self.tris[self.bvh_faces].tolist()
         self.bvh = BVHTree.FromPolygons(verts, polys, all_triangles=True)
