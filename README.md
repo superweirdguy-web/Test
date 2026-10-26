@@ -11,6 +11,8 @@ a quad patch is generated immediately with the pattern-based quadrangulation of
 *Pattern-Based Quadrangulation for N-Sided Patches* (Takayama et al., SGP 2014). You then refine the
 topology (edge counts, irregular vertices, T-junctions, edge loops) and export a clean quad mesh.
 
+![Sketching a square and a triangle on a sphere, then changing curve span counts](docs/demo.gif)
+
 The add-on is a line-by-line port of the original C++ source (SketchRetopo + patchgen). All ten
 editing modes, the shortcuts, the snapping and T-junction rules, the patch patterns, undo/redo,
 symmetry, and the XML file format behave like the original program.
@@ -160,6 +162,13 @@ keyboard events and saves screenshots (Linux, needs `xvfb-run` and ImageMagick):
 
 ```
 xvfb-run -a -s "-screen 0 1600x1000x24" blender --enable-event-simulate --python tests/gui_test.py -- /tmp/gui
+```
+
+`tools/record_demo.py` records the demo above the same way and writes `demo.mp4` and `demo.gif`
+(also needs `ffmpeg`):
+
+```
+xvfb-run -a -s "-screen 0 1600x1000x24" blender --factory-startup --enable-event-simulate --python tools/record_demo.py -- /tmp/demo
 ```
 
 ## License and credits
