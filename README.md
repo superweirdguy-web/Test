@@ -144,6 +144,9 @@ sketch_retopo/*.py    Blender integration (modal operator, drawing, panels, sess
 tests/                tests (run with the `bpy` module from PyPI or inside Blender)
 ```
 
+`tests/test_patchgen.py` only needs `numpy`. The other tests also need `mathutils`, which comes with the
+`bpy` package (the bpy 5.2 wheel is built for Python 3.13). GitHub Actions runs these four tests on every push.
+
 ```
 pip install bpy            # matching your Python version
 python tests/test_patchgen.py
