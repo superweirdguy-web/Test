@@ -16,10 +16,14 @@ import numpy as np
 from .pn import (Polyline, pn_norm, pn_normalize, normalized, norm3, dot3, cross3, distance_to_line,
                  project_to_line, acos_clamped, rbf_wendland)
 from .curvenetwork import (Patch, alive, voh_iter, vih_iter, voc_iter, ch_iter, pc_iter, set_next_prev,
-                           set_vertex_halfedge, delete_halfedge, delete_halfchain, IMAGINARY_SYMMETRY)
+                           set_vertex_halfedge, delete_halfedge, delete_halfchain, delete_patch, IMAGINARY_SYMMETRY,
+                           loop_valid_for_patch)
 from . import patchgen
 
 LEFT, RIGHT, MIDDLE = 'LEFT', 'RIGHT', 'MIDDLE'
+
+# ConfigRender::Color::active, used by the SketchRetopo2 modes
+ACTIVE = (1.0, 0.2, 0.1)
 
 
 class State:
@@ -63,7 +67,7 @@ def _curve_points(curve):
 
 class StateSketch(State):
     state_name = 'basic sketching'
-    state_color = (1, 0.5, 0.1)
+    state_color = ACTIVE
 
     def init(self):
         self.core.common_sketch_curve.clear()
@@ -77,12 +81,23 @@ class StateSketch(State):
         core = self.core
         if core.common_pn_mouse is None:
             return
-        if 'z' not in core.common_key_pressed:
-            return
-        # fix weird problem around clicked area
+        keys = core.common_key_pressed
+        if 'z' in keys:
+            self._fix_around(core.common_pn_mouse)
+        elif 'v' in keys:
+            self._delete_patch_at(core.common_pn_mouse)
+        elif 'b' in keys or 'n' in keys:
+            # curve along the base mesh boundary starting from the clicked boundary vertex (B: exact, N: inset)
+            h = core.basemesh_boundary_halfedge_near(core.common_pn_mouse, core.configTemp.snapSize())
+            if h >= 0:
+                core.trace_basemesh_boundary(h, 'b' in keys)
+
+    def _fix_around(self, pn_mouse):
+        """Hold Z and click: reconnects the curves crossing the snapping sphere at the clicked point."""
+        core = self.core
         cn = core.curvenetwork
-        pn_mouse = core.common_pn_mouse
         crossing = []
+        to_delete = []
         thr = core.configTemp.snapSize()
         for h in list(cn.halfedges):
             if h.is_deleted:
@@ -91,12 +106,20 @@ class StateSketch(State):
             d1 = pn_norm(pn_mouse - h.vertex.pn)
             if d0 < thr < d1:
                 crossing.append([0.0, h])
+            # halfedges completely inside the snapping radius are erased
             if d0 < thr and d1 < thr:
-                delete_halfedge(h)
-        crossing = [p for p in crossing if not p[1].is_deleted]
+                to_delete.append(h)
         if not crossing:
             return
         core.memento_store()
+        for h in to_delete:
+            delete_halfedge(h)
+        crossing = [p for p in crossing if not p[1].is_deleted]
+        if not crossing:
+            cn.garbage_collect()
+            cn.generate_halfchains()
+            core.generate_patches()
+            return
         v_center = cn.new_vertex()
         v_center.pn = pn_mouse.copy()
         d0 = crossing[0][1].from_vertex().pn[:3] - v_center.pn[:3]
@@ -127,47 +150,80 @@ class StateSketch(State):
         core.generate_patches()
         cn.invalidate_displist()
 
+    def _delete_patch_at(self, pn_mouse):
+        """Hold V and click: deletes the patch under the mouse (its curves stay)."""
+        core = self.core
+        mouse_pos = pn_mouse[:3]
+        snap = core.configTemp.snapSize()
+        best = None
+        best_d = float('inf')
+        for patch in core.curvenetwork.patches:
+            P = patch.pn[:, :3]
+            if len(P) == 0:
+                continue
+            lo = P.min(axis=0) - snap
+            hi = P.max(axis=0) + snap
+            if not (np.all(lo <= mouse_pos) and np.all(mouse_pos <= hi)):
+                continue
+            d = patch.distance(mouse_pos)
+            if d < best_d:
+                best_d = d
+                best = patch
+        if best is None or best_d > snap:
+            return
+        core.memento_store()
+        delete_patch(best)
+        core.curvenetwork.garbage_collect()
+        core.curvenetwork.invalidate_displist()
+
+    def _generate_patch_manually(self, curve):
+        """Hold X and drag from a curve into an empty region: generates the patch for the loop of curves on that
+        side (also loops that are not filled automatically, e.g. with more than 6 corners)."""
+        core = self.core
+        best = None
+        best_d = float('inf')
+        for v in core.curvenetwork.vertices:
+            if v.is_deleted or v.is_corner():
+                continue
+            d = pn_norm(v.pn - curve.front())
+            if d < best_d:
+                best_d = d
+                best = v
+        if best is None or best_d > core.configTemp.snapSize() or best.halfedge is None:
+            return
+        n = best.pn[3:]
+        d1 = normalized(best.halfedge.to_vector())
+        d2 = normalized((curve.back() - best.pn)[:3])
+        is_left = dot3(np.cross(n, d1), d2)
+        h = best.halfedge if is_left > 0 else best.halfedge.opposite
+        c = h.halfchain if h is not None else None
+        if c is None or alive(c.patch):
+            # this side already has a patch
+            return
+        if loop_valid_for_patch(c) is None:
+            return
+        core.generate_patch(c)
+        core.curvenetwork.garbage_collect()
+
     def mouse_up(self, x, y, button, shift, ctrl, alt):
         core = self.core
         curve = core.common_sketch_curve
-        if curve.size() < 3:
-            self.init()
-            return
-        core.memento_store()
-        if 'c' in core.common_key_pressed:
-            core.curvenetwork.erase_curve(curve)
-        elif 'x' in core.common_key_pressed:
-            pass   # TODO in the original
-        else:
-            has_negative = any(pn[0] < 0 for pn in curve.points)
-            if core.configSaved.symmetric and has_negative:
-                pts = curve.points
-                if curve.is_loop:
-                    pos = len(pts)
-                    for k in range(len(pts) - 1):
-                        if pts[k][0] < 0 and not pts[k + 1][0] < 0:
-                            pos = k
-                            break
-                    pts = pts[pos:] + pts[:pos]
-                split_curves = []
-                is_new = True
-                for pn in pts:
-                    if pn[0] < 0:
-                        is_new = True
-                        continue
-                    if is_new:
-                        split_curves.append(Polyline())
-                    is_new = False
-                    split_curves[-1].push_back(pn)
-                for sc in split_curves:
-                    if sc.size() >= 2:
-                        core.add_curve_open_delegate(sc, not ctrl)
+        try:
+            if curve.size() < 3:
+                return
+            core.memento_store()
+            if 'c' in core.common_key_pressed:
+                # erase parts of the curve network crossing the scribble
+                core.curvenetwork.erase_curve(curve)
+            elif 'x' in core.common_key_pressed:
+                self._generate_patch_manually(curve)
             elif curve.is_loop:
                 core.curvenetwork.add_curve_loop(curve)
             else:
                 core.add_curve_open_delegate(curve, not ctrl)
-        core.generate_patches()
-        self.init()
+            core.generate_patches()
+        finally:
+            self.init()
 
     def keyboard(self, key):
         core = self.core
@@ -175,7 +231,7 @@ class StateSketch(State):
             return
         erased = []
         for v in core.curvenetwork.vertices:
-            if v.is_openend() and not v.on_symmetry_plane() and v.halfedge.halfchain is not None:
+            if v.is_openend() and v.halfedge.halfchain is not None:
                 erased.append(v.halfedge.halfchain.edgechain)
         seen = set()
         erased_u = []
@@ -304,7 +360,7 @@ class StateAutocmpl(State):
 
 class StateLaser(State):
     state_name = 'laser sketching'
-    state_color = (0.5, 0, 1)
+    state_color = ACTIVE
 
     def show_brushSize_snap(self):
         return False
@@ -373,7 +429,7 @@ class StateLaser(State):
 
 class StateCylinder(State):
     state_name = 'cylinder sketching'
-    state_color = (0.5, 0.7, 0.3)
+    state_color = ACTIVE
 
     def init(self):
         self.core.common_sketch_curve.clear()
@@ -397,7 +453,7 @@ class StateCylinder(State):
 
 class StateDeformCurve(State):
     state_name = 'deform curve'
-    state_color = (0.3, 0.8, 0.2)
+    state_color = ACTIVE
 
     def init(self):
         self.mode = None            # None / 'DragCorner' / 'DragSide' / 'OverSketch'
@@ -518,18 +574,17 @@ class StateDeformCurve(State):
                 patch = c.patch
                 if patch is None or patch.is_imaginary():
                     continue
+                patch.flag = 1
                 if all(patch is not p for p in affected_patches):
                     affected_patches.append(patch)
-        for patch in affected_patches:
-            if not patch.is_deleted:
-                patch.clear()
         try:
             self._snap_selected_vertex()
         finally:
+            # update patch vertex positions (the topology is kept)
             for patch in affected_patches:
                 if patch.is_deleted:
                     continue
-                patch.generate_topology(False)
+                patch.set_boundary_pn()
                 core.compute_patch_interior_pn(patch)
                 patch.invalidate_displist()
             cn.invalidate_displist()
@@ -736,7 +791,7 @@ class StateDeformCurve(State):
 
 class StateEditCorner(State):
     state_name = 'edit corner'
-    state_color = (0.8, 0.5, 0.6)
+    state_color = ACTIVE
 
     def init(self):
         self.pn_prev = None
@@ -821,8 +876,9 @@ class StateEditCorner(State):
         h_selected.is_corner = not h_selected.is_corner
         patch = h_selected.patch()
         if patch is not None and not patch.is_imaginary():
-            patch.generate_topology()
-            core.compute_patch_interior_pn(patch)
+            delete_patch(patch)
+            core.generate_patch(h_selected.halfchain)
+            core.curvenetwork.garbage_collect()
         core.curvenetwork.invalidate_displist()
         self.init()
 
@@ -831,11 +887,12 @@ class StateEditCorner(State):
 
 class StateEditTopology(State):
     state_name = 'edit topology'
-    state_color = (1, 0, 0)
+    state_color = ACTIVE
     edit_level = 'QUAD_MESH'
 
     def init(self):
         self.current_patch = None
+        self.param = None
         self.selected_variable = 0
         self.p_prev = None
         self.average_edge_length = 0.0
@@ -849,14 +906,22 @@ class StateEditTopology(State):
         d = normalized(np.cross(n, d)) * self.average_edge_length * 0.5
         return pn[:3] - d, pn[:3] + d, n
 
+    def _current(self):
+        cp = self.current_patch
+        if cp is None or cp.is_deleted or self.param is None:
+            return None
+        return cp
+
     def display(self, drawer):
         core = self.core
-        cp = self.current_patch
-        if cp is not None and not cp.is_deleted:
-            drawer.patch_fill(cp, self.state_color + (0.3,))
-            param = cp.param
+        cr = core.configRender
+        cp = self._current()
+        if cp is not None:
+            drawer.patch_fill(cp, cr.color_active + (cr.color_patch_alpha,))
+            param = self.param
             num_sides = param.get_num_sides()
             num_variables = patchgen.get_num_variables(num_sides, param.pattern_id)
+            # arrows for the padding parameters, only when the pattern allows adjusting them
             if num_sides != 4 and num_sides < num_variables:
                 for i in range(num_sides):
                     j = param.permutation[i]
@@ -880,22 +945,25 @@ class StateEditTopology(State):
                     pn0 = cp.pn[v0]
                     pn1 = cp.pn[v1]
                     drawer.double_arrow(pn0[:3], pn1[:3], normalized((pn0 + pn1)[3:]), color)
-        # selected curves
+        # selected curves, with their number of edges at the midpoint
         pts = []
         for e in core.curvenetwork.edgechains:
-            if not e.flag:
+            if not e.flag or e.is_deleted or e.halfchain[0] is None:
                 continue
             c = e.halfchain[0]
             strip = [c.halfedge_front.from_vertex().pn[:3]]
+            mid = []
             for h in ch_iter(c):
                 pn = h.vertex.pn
                 strip.append(pn[:3] + pn[3:] * core.configSaved.projOffset * 0.1)
+                mid.append(pn[:3])
             for a, b in zip(strip[:-1], strip[1:]):
                 pts.append(a)
                 pts.append(b)
+            if mid:
+                drawer.text(np.mean(mid, axis=0), str(e.num_subdiv), (1, 1, 1))
         if pts:
-            drawer.lines(pts, self.state_color + (0.5,), 5)
-        drawer.num_subdiv_points((0.1, 0.2, 1.0))
+            drawer.lines(pts, cr.color_active, 5)
 
     def mouse_down(self, x, y, button, shift, ctrl, alt):
         core = self.core
@@ -903,17 +971,19 @@ class StateEditTopology(State):
             self.init()
             return
         mouse_pos = core.common_pn_mouse[:3]
-        cp = self.current_patch
-        if cp is not None and not cp.is_deleted:
-            param = cp.param
+        cp = self._current()
+        if cp is not None:
+            param = self.param
             num_sides = param.get_num_sides()
             if num_sides == 4:
+                # 4-sided patch: edit the topology by dragging the singularities around
                 if cp.distance(mouse_pos) < core.configTemp.snapSize():
                     self.p_prev = mouse_pos.copy()
                     core.memento_store()
                 else:
                     self.init()
             else:
+                # select the current patch's parameter
                 best = None
                 best_d = float('inf')
                 for i in range(num_sides):
@@ -960,11 +1030,14 @@ class StateEditTopology(State):
                 best_e = v.halfedge.halfchain.edgechain
         if best_e is not None:
             if shift:
+                # toggle selection/de-selection
                 best_e.flag = 0 if best_e.flag else 1
             elif ctrl:
-                c0 = best_e.halfchain[0]
-                patch = best_e.halfchain[0 if Patch.is_ordinary(c0.patch) else 1].patch
-                if not Patch.is_ordinary(patch):
+                # select the sequence of curves on the same quad strip
+                patch = best_e.halfchain[0].patch if best_e.halfchain[0] is not None else None
+                if not alive(patch) and best_e.halfchain[1] is not None:
+                    patch = best_e.halfchain[1].patch
+                if not alive(patch):
                     return
                 h_best = -1
                 hd = float('inf')
@@ -982,18 +1055,18 @@ class StateEditTopology(State):
                     if p.h_chain[h] is not None:
                         p.h_chain[h].edgechain.flag = 1
             else:
+                # select the clicked curve only
                 self.init()
                 best_e.flag = 1
             return
 
         self.init()
+
+        # select the patch under the mouse
         best_p = None
         best_pd = float('inf')
         snap = core.configTemp.snapSize()
         for patch in core.curvenetwork.patches:
-            num_sides = patch.param.get_num_sides()
-            if num_sides == 4 and patch.param.pattern_id == 0:
-                continue
             P = patch.pn[:, :3]
             if len(P) == 0:
                 continue
@@ -1005,22 +1078,35 @@ class StateEditTopology(State):
             if d < best_pd:
                 best_pd = d
                 best_p = patch
-        if best_p is not None and best_pd < snap:
-            self.current_patch = best_p
-            self.selected_variable = best_p.param.get_num_sides()
-            total = 0.0
-            ne = best_p.n_edges()
-            for e in range(ne):
-                v0, v1 = best_p.util_edge_to_vertex_pair(e)
-                total += norm3(best_p.pn[v1][:3] - best_p.pn[v0][:3])
-            self.average_edge_length = total / ne if ne else 0.0
+        if best_p is None or best_pd > snap:
+            return
+        num_corners = best_p.num_corners()
+        if num_corners < 2 or 6 < num_corners:
+            return
+        # the patch gets the default topology for its boundary, whose parameter is then edited
+        param = best_p.generate_topology_default()
+        if param is None:
+            return
+        core.compute_patch_interior_pn(best_p)
+        if param.get_num_sides() == 4 and param.pattern_id == 0:
+            self.init()
+            return
+        self.current_patch = best_p
+        self.param = param
+        self.selected_variable = param.get_num_sides()
+        total = 0.0
+        ne = best_p.n_edges()
+        for e in range(ne):
+            v0, v1 = best_p.util_edge_to_vertex_pair(e)
+            total += norm3(best_p.pn[v1][:3] - best_p.pn[v0][:3])
+        self.average_edge_length = total / ne if ne else 0.0
 
     def mouse_move(self, x, y):
         core = self.core
-        cp = self.current_patch
+        cp = self._current()
         if cp is None or core.common_pn_mouse is None or not core.common_button_left_pressed or self.p_prev is None:
             return
-        param = cp.param
+        param = self.param
         if param.get_num_sides() != 4:
             return
         d = core.common_pn_mouse[:3] - self.p_prev
@@ -1036,24 +1122,24 @@ class StateEditTopology(State):
         scores = [-dot3(d, e[i]) for i in range(4)]
         sel = int(np.argmin(scores))
         if patchgen.adjust_parameter(param, param.permutation[sel], param.permutation.is_flipped()):
-            cp.generate_topology(False)
+            cp.generate_topology_param(param)
             core.compute_patch_interior_pn(cp)
         self.p_prev = core.common_pn_mouse[:3].copy()
 
     def keyboard(self, key):
         core = self.core
-        cp = self.current_patch
-        if cp is not None and not cp.is_deleted:
+        cp = self._current()
+        if cp is not None:
             if key not in ('z', 'x', 'c', 'v', 'b', 'B'):
                 return
             core.memento_store()
             do_update = False
             if key in ('z', 'x', 'c', 'v'):
-                do_update = patchgen.adjust_parameter(cp.param, self.selected_variable, key in ('c', 'v'))
+                do_update = patchgen.adjust_parameter(self.param, self.selected_variable, key in ('c', 'v'))
             if key in ('b', 'B'):
-                do_update = patchgen.switch_pattern(cp.param, key == 'b')
+                do_update = patchgen.switch_pattern(self.param, key == 'b')
             if do_update:
-                cp.generate_topology(False)
+                cp.generate_topology_param(self.param)
                 core.compute_patch_interior_pn(cp)
             return
         if key not in ('z', 'x', 'c', 'v'):
@@ -1061,23 +1147,27 @@ class StateEditTopology(State):
         core.memento_store()
         updated = []
         for e in core.curvenetwork.edgechains:
-            if not e.flag:
+            if not e.flag or e.is_deleted:
                 continue
             old = e.num_subdiv
             e.num_subdiv += {'z': -1, 'v': 1, 'x': -2, 'c': 2}[key]
             if e.num_subdiv < 1:
                 e.num_subdiv = old
                 continue
+            updated.append(e)
+        # the patches on both sides are deleted and generated again (left empty when the total is odd)
+        deleted_patch_halfchains = []
+        for e in updated:
             for i in range(2):
-                p = e.halfchain[i].patch if e.halfchain[i] is not None else None
-                if p is None or p.is_imaginary():
-                    continue
-                if all(p is not q for q in updated):
-                    updated.append(p)
-                p.clear()
-        for p in updated:
-            p.generate_topology()
-            core.compute_patch_interior_pn(p)
+                c = e.halfchain[i]
+                if c is not None and alive(c.patch) and not c.patch.is_imaginary():
+                    deleted_patch_halfchains.append(c)
+                    delete_patch(c.patch)
+        core.curvenetwork.garbage_collect()
+        for c in deleted_patch_halfchains:
+            if alive(c) and not alive(c.patch):
+                core.generate_patch(c)
+        core.curvenetwork.garbage_collect()
         core.curvenetwork.invalidate_displist()
 
 
@@ -1085,7 +1175,7 @@ class StateEditTopology(State):
 
 class StateEdgeLoop(State):
     state_name = 'edge loop'
-    state_color = (0, 0.5, 0)
+    state_color = ACTIVE
     edit_level = 'QUAD_MESH'
 
     def init(self):
@@ -1155,7 +1245,7 @@ class StateEdgeLoop(State):
 
 class StateMoveVertex(State):
     state_name = 'move vertex'
-    state_color = (0.8, 1, 0.2)
+    state_color = ACTIVE
     edit_level = 'QUAD_MESH'
 
     def show_brushSize_snap(self):
@@ -1221,3 +1311,246 @@ class StateMoveVertex(State):
             core.memento_store()
             core.vertices_smooth_global()
             core.curvenetwork.invalidate_displist()
+
+
+# ---- query database (SketchRetopo2, data-driven quadrangulation) --------------------------------------------
+
+class QueryData:
+    """learnquad::QueryData: the base mesh region under the selected patch (parameterized into the patch's
+    polygon), the patch boundary, and the flow strokes drawn by the user."""
+
+    def __init__(self):
+        self.basemesh_vertices_xyz = np.zeros((0, 3))
+        self.basemesh_vertices_normal = np.zeros((0, 3))
+        self.basemesh_vertices_uv = np.zeros((0, 2))
+        self.basemesh_faces = np.zeros((0, 3), dtype=np.int64)
+        self.num_subdiv = []
+        self.boundary_xyz = np.zeros((0, 3))
+        self.boundary_uv = np.zeros((0, 2))
+        self.strokes = []        # [(points_xyz (n, 3), points_uv (n, 2), is_loop)]
+
+
+class StateQueryDB(State):
+    state_name = 'query database'
+    state_color = ACTIVE
+    edit_level = 'QUAD_MESH'
+
+    def __init__(self, core):
+        State.__init__(self, core)
+        self.freeze = False        # keep showing the current result while the lookup goes on
+        self.init()
+
+    def init(self):
+        lq = self.core.learnquad
+        if lq is not None:
+            lq.stop()
+        self.querydata = QueryData()
+        self.lookup_index = -1
+        self.selected_patch = None
+        self.current_stroke = Polyline()
+        self.floodfill = None
+        self.basemesh_uv = None
+        self.status = 'idle'
+        self.status_msg = ''
+        self._num_results_shown = -1
+
+    def exit(self):
+        lq = self.core.learnquad
+        if lq is not None:
+            lq.stop()
+
+    # ---- lookup progress (called by the host while this mode is active) ----
+    def update(self, time_budget=0.03):
+        lq = self.core.learnquad
+        if lq is None or self.status in ('idle', 'complete'):
+            return False
+        lq.step(time_budget)
+        status = lq.status
+        changed = status != self.status or lq.num_results() != self._num_results_shown
+        self.status = status
+        if changed:
+            self._num_results_shown = lq.num_results()
+            self.update_status_msg()
+            if not self.freeze and self.lookup_index >= 0:
+                self.update_patch()
+        return changed
+
+    def update_patch(self):
+        lq = self.core.learnquad
+        p = self.selected_patch
+        if lq is None or p is None or p.is_deleted:
+            return
+        if not lq.convert_result(self.lookup_index, p):
+            return
+        for v in p.vertices():
+            self.core.project(p.pn[v])
+        p.invalidate_displist()
+        self.core.curvenetwork.invalidate_displist()
+
+    def update_status_msg(self):
+        lq = self.core.learnquad
+        if self.status == 'idle':
+            self.status_msg = ''
+        elif self.status == 'flushing':
+            self.status_msg = 'flushing... %d' % lq.num_results()
+        else:
+            msg = {'started': 'started...', 'progress': 'in progress...', 'complete': 'complete!'}.get(self.status,
+                                                                                                 'canceled.')
+            n = lq.num_results() if lq is not None else 0
+            self.status_msg = 'lookup %s\n' % msg + (
+                '(no patches found yet)' if n == 0 else 'patch index: %d / %d' % (self.lookup_index, n - 1))
+
+    def display(self, drawer):
+        core = self.core
+        cr = core.configRender
+        if core.learnquad is None:
+            drawer.screen_text('No patch database loaded (SketchRetopo sidebar > Query Database)')
+        p = self.selected_patch
+        if p is not None and not p.is_deleted:
+            drawer.patch_fill(p, cr.color_active + (cr.color_patch_alpha,))
+            for pts, _, is_loop in self.querydata.strokes:
+                strip = list(pts) + ([pts[0]] if is_loop and len(pts) else [])
+                drawer.line_strip(strip, cr.color_active, 1)
+            if self.current_stroke.size() >= 2:
+                drawer.line_strip(_curve_points(self.current_stroke), cr.color_active, 1)
+        if self.status_msg:
+            drawer.screen_text(self.status_msg)
+
+    def _face_in_region(self, pn):
+        hit = self.core.intersect(pn)
+        if hit is None or self.floodfill is None:
+            return None
+        return hit if self.floodfill[hit.face] else None
+
+    def mouse_down(self, x, y, button, shift, ctrl, alt):
+        core = self.core
+        if core.common_pn_mouse is None:
+            self.init()
+            return
+        mouse_pos = core.common_pn_mouse[:3]
+        snap = core.configTemp.snapSize()
+        best = None
+        best_d = float('inf')
+        for patch in core.curvenetwork.patches:
+            P = patch.pn[:, :3]
+            if len(P) == 0:
+                continue
+            lo = P.min(axis=0) - snap
+            hi = P.max(axis=0) + snap
+            if not (np.all(lo <= mouse_pos) and np.all(mouse_pos <= hi)):
+                continue
+            d = patch.distance(mouse_pos)
+            if d < best_d:
+                best_d = d
+                best = patch
+        if best is None or best_d > snap:
+            # clicked elsewhere
+            self.init()
+            return
+        lq = core.learnquad
+        if best is not self.selected_patch:
+            # selected a new patch: parameterize the base mesh under it and set the query data
+            if lq is not None:
+                lq.stop()
+            self.selected_patch = best
+            self.querydata = QueryData()
+            self.lookup_index = -1
+            self.status = 'idle'
+            self.update_status_msg()
+            boundary_uv = core.patch_boundary_uv(best)
+            hit = core.intersect(core.common_pn_mouse)
+            if hit is None or not boundary_uv:
+                self.init()
+                return
+            res = core.parameterize_basemesh_under_patch(best, hit.face, boundary_uv)
+            if res is None:
+                self.init()
+                return
+            submesh_faces, self.floodfill, self.basemesh_uv = res
+            bm = core.basemesh
+            qd = self.querydata
+            verts = np.unique(bm.tris[submesh_faces].reshape(-1))
+            remap = -np.ones(len(bm.verts), dtype=np.int64)
+            remap[verts] = np.arange(len(verts))
+            qd.basemesh_vertices_xyz = bm.verts[verts].copy()
+            qd.basemesh_vertices_normal = bm.normals[verts].copy()
+            qd.basemesh_vertices_uv = self.basemesh_uv[verts].copy()
+            qd.basemesh_faces = remap[bm.tris[submesh_faces]]
+            qd.num_subdiv = best.num_subdiv_all()
+            # patch boundary vertices from corner 0 in the patch's order
+            p_h = best.halfedge_handle(best.patch_corner(0))
+            bxyz, buv = [], []
+            for _ in range(sum(qd.num_subdiv)):
+                v = best.from_vertex_handle(p_h)
+                bxyz.append(best.pn[v][:3].copy())
+                buv.append(boundary_uv[v])
+                p_h = best.prev_halfedge_handle(p_h)
+            qd.boundary_xyz = np.array(bxyz)
+            qd.boundary_uv = np.array(buv)
+            return
+        if not shift:
+            self.querydata.strokes = []
+        # start a flow stroke inside the patch
+        if self._face_in_region(core.common_pn_mouse) is None:
+            return
+        self.current_stroke.push_back(core.common_pn_mouse)
+
+    def mouse_move(self, x, y):
+        core = self.core
+        if core.common_pn_mouse is not None and not self.current_stroke.empty():
+            if self._face_in_region(core.common_pn_mouse) is None:
+                return
+            self.current_stroke.push_back(core.common_pn_mouse)
+
+    def mouse_up(self, x, y, button, shift, ctrl, alt):
+        core = self.core
+        stroke = self.current_stroke
+        if stroke.empty():
+            return
+        lq = core.learnquad
+        ct = core.configTemp
+        stroke.is_loop = stroke.size() > 2 and pn_norm(stroke.back() - stroke.front()) < ct.snapSize()
+        stroke.smooth(30)
+        stroke.resample_by_length(ct.segmentSize())
+        if stroke.length() < ct.segmentSize():
+            self.current_stroke = Polyline()
+            if not self.querydata.strokes and lq is not None:
+                lq.stop()
+            return
+        bm = core.basemesh
+        pts, uvs = [], []
+        for pn in stroke.points:
+            hit = self._face_in_region(pn)
+            if hit is None:
+                continue
+            a, b, c = bm.tris[hit.face]
+            uv = ((1 - hit.u - hit.v) * self.basemesh_uv[a] + hit.u * self.basemesh_uv[b] +
+                  hit.v * self.basemesh_uv[c])
+            pts.append(np.asarray(pn[:3], dtype=float))
+            uvs.append(uv)
+        self.current_stroke = Polyline()
+        if len(pts) < 2:
+            return
+        self.querydata.strokes.append((np.array(pts), np.array(uvs), stroke.is_loop))
+        if lq is None:
+            core.report('No patch database loaded', 'WARNING')
+            return
+        # perform the lookup
+        core.memento_store()
+        lq.stop()
+        lq.start_lookup(self.querydata)
+        self.status = 'started'
+        self._num_results_shown = -1
+        self.lookup_index = 0
+        self.update_status_msg()
+
+    def keyboard(self, key):
+        lq = self.core.learnquad
+        if key not in ('z', 'x') or lq is None:
+            return
+        n = lq.num_results()
+        self.lookup_index = min(max(self.lookup_index + (-1 if key == 'z' else 1), 0), n - 1)
+        if self.lookup_index >= 0:
+            self.update_patch()
+            self.update_status_msg()
+

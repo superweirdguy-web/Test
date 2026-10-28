@@ -26,7 +26,18 @@ class BlenderView:
         self._mvp = np.array(rv3d.perspective_matrix @ M)
 
     def camera_distance(self):
-        return self.rv3d.view_distance / self.scale
+        """The eye distance SketchRetopo2 would have for the same view.  Snapping radius, brush sizes and corner
+        sizes are proportional to it, so they keep the same size on screen as in the original program (which
+        uses a 40 degree perspective, or an orthographic view 2.5 x 0.1 x distance high)."""
+        wm = self.rv3d.window_matrix
+        k = abs(wm[1][1]) or 1.0
+        if self.rv3d.is_perspective:
+            half_height = self.rv3d.view_distance / k
+            d = half_height / math.tan(math.radians(20.0))
+        else:
+            half_height = 1.0 / k
+            d = half_height / 0.25
+        return d / self.scale
 
     def eye_world(self):
         return self.rv3d.view_matrix.inverted().translation
@@ -36,7 +47,7 @@ class BlenderView:
 
     def eye_to_center(self):
         d = self.rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
-        return np.array(self.Minv3 @ d) * self.camera_distance()
+        return np.array(self.Minv3 @ d) * (self.rv3d.view_distance / self.scale)
 
     def is_ortho(self):
         return not self.rv3d.is_perspective

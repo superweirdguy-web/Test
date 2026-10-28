@@ -283,14 +283,12 @@ def trace_halfchains(in_c):
 
 
 def delete_patch(p):
+    # SketchRetopo2: the curves keep their num_subdiv (shown as points along curves without patches)
     if p is None or p.is_deleted or p.is_imaginary():
         return
     p.is_deleted = True
     for c in list(pc_iter(p)):
         c.patch = None
-        opp = c.opposite()
-        if alive(opp) and not Patch.is_ordinary(opp.patch):
-            c.edgechain.num_subdiv = 0
 
 
 def delete_halfchain(c):
@@ -322,6 +320,117 @@ def delete_halfedge(h):
         break
     if is_isolated:
         v.is_deleted = True
+
+
+# ---- static patch functions on a loop of halfchains (curvenetwork/Patch_static.cc) --------------------------
+
+def _loop(halfchain):
+    """Halfchains of the loop starting at `halfchain` (None if the loop is not closed)."""
+    out = []
+    c = halfchain
+    while True:
+        if not alive(c):
+            return None
+        out.append(c)
+        c = c.next()
+        if c is halfchain:
+            return out
+        if len(out) > 1000000:
+            return None
+
+
+def loop_valid_for_patch(halfchain):
+    """Patch::is_valid_for_patch: if the halfchains form a closed loop with at least one corner, returns the
+    halfchain following a corner (so that the loop starts at a side), else None."""
+    loop = _loop(halfchain)
+    if loop is None:
+        return None
+    c_corner = None
+    for c in loop:
+        if c.is_corner():
+            c_corner = c
+    if c_corner is None:
+        return None
+    return c_corner.next()
+
+
+def loop_num_corners(halfchain):
+    loop = _loop(halfchain)
+    return 0 if loop is None else sum(1 for c in loop if c.is_corner())
+
+
+def _loop_sides(halfchain):
+    """Halfchains of the loop grouped by side (a side ends at a corner)."""
+    sides = [[]]
+    for c in _loop(halfchain) or []:
+        sides[-1].append(c)
+        if c.is_corner():
+            sides.append([])
+    if not sides[-1]:
+        sides.pop()
+    return sides
+
+
+def loop_num_subdiv(halfchain, side_index=None):
+    sides = _loop_sides(halfchain)
+    if side_index is None:
+        return [sum(c.num_subdiv() for c in side) for side in sides[:loop_num_corners(halfchain)]]
+    if side_index >= len(sides):
+        return 0
+    return sum(c.num_subdiv() for c in sides[side_index])
+
+
+def loop_num_free_halfchains(halfchain, side_index):
+    sides = _loop_sides(halfchain)
+    if side_index >= len(sides):
+        return -1
+    return sum(1 for c in sides[side_index] if c.num_subdiv() == 0)
+
+
+def loop_side_length(halfchain, side_index):
+    sides = _loop_sides(halfchain)
+    if side_index >= len(sides):
+        return 0.0
+    return sum(c.length() for c in sides[side_index])
+
+
+def loop_change_num_subdiv(halfchain, side_index, target_num_subdiv):
+    delta_target = target_num_subdiv - loop_num_subdiv(halfchain, side_index)
+    if delta_target <= 0:
+        return
+    sides = _loop_sides(halfchain)
+    if side_index >= len(sides):
+        return
+    c_free = [c for c in sides[side_index] if c.num_subdiv() == 0]
+    if not c_free:
+        return
+    lengths = [c.length() for c in c_free]
+    length_sum = sum(lengths)
+    for c, length in zip(c_free, lengths):
+        ns = int(math.floor(0.5 + delta_target * length / length_sum)) if length_sum > 0 else delta_target
+        if Patch.use_even_num_subdiv and ns % 2:
+            ns += 1
+        c.edgechain.num_subdiv = ns
+
+
+def loop_set_default_num_subdiv(halfchain):
+    """Patch::set_default_num_subdiv: sets num_subdiv of the free (unspecified) edgechains around the loop."""
+    num_sides = loop_num_corners(halfchain)
+    for i in range(num_sides):
+        j = (i + 2) % num_sides
+        is_fixed_i = loop_num_free_halfchains(halfchain, i) == 0
+        is_fixed_j = loop_num_free_halfchains(halfchain, j) == 0
+        if not is_fixed_i and not is_fixed_j:
+            target = max(int(loop_side_length(halfchain, i) / Patch.quadSize),
+                         int(loop_side_length(halfchain, j) / Patch.quadSize),
+                         loop_num_subdiv(halfchain, i) + loop_num_free_halfchains(halfchain, i),
+                         loop_num_subdiv(halfchain, j) + loop_num_free_halfchains(halfchain, j))
+            loop_change_num_subdiv(halfchain, i, target)
+            loop_change_num_subdiv(halfchain, j, target)
+        elif not is_fixed_i:
+            loop_change_num_subdiv(halfchain, i, loop_num_subdiv(halfchain, j))
+        elif not is_fixed_j:
+            loop_change_num_subdiv(halfchain, j, loop_num_subdiv(halfchain, i))
 
 
 # ---- Patch ------------------------------------------------------------------------------------------
@@ -543,38 +652,31 @@ class Patch(PolyMesh):
         P = self._pn[:self._nv, :3]
         return _min_distance_to_quads(P[quads], np.asarray(p, dtype=float))
 
-    def generate_topology(self, init_param=True):
-        num_sides = self.num_corners()
-        if init_param:
-            for i in range(num_sides):
-                j = (i + 2) % num_sides
-                is_fixed_i = self.num_free_halfchains(i) == 0
-                is_fixed_j = self.num_free_halfchains(j) == 0
-                if not is_fixed_i and not is_fixed_j:
-                    target = max(int(self.side_length(i) / Patch.quadSize),
-                                 int(self.side_length(j) / Patch.quadSize),
-                                 self.num_subdiv(i) + self.num_free_halfchains(i),
-                                 self.num_subdiv(j) + self.num_free_halfchains(j))
-                    self.change_num_subdiv(i, target)
-                    self.change_num_subdiv(j, target)
-                elif not is_fixed_i:
-                    self.change_num_subdiv(i, self.num_subdiv(j))
-                elif not is_fixed_j:
-                    self.change_num_subdiv(j, self.num_subdiv(i))
-            l = [self.num_subdiv(i) for i in range(num_sides)]
-            self.is_failure = sum(l) % 2 != 0
-            if self.is_failure:
-                l = [Patch.failure_patch_num_subdiv] * num_sides
-            param = patchgen.get_default_parameter(l)
-            if param is None:
-                # no pattern can realize this boundary (the original asserts here); show it as a failure patch
-                self.is_failure = True
-                param = patchgen.get_default_parameter([Patch.failure_patch_num_subdiv] * num_sides)
-            self.param = param
-        if self.param is None or self.param.pattern_id < 0 or not (2 <= self.param.get_num_sides() <= 6):
-            self.clear()
-            return
-        patchgen.generate_topology(self.param, self)
+    def set_halfchain(self, halfchain):
+        """Patch::set_halfchain: attaches this patch to the loop starting at `halfchain`."""
+        self.halfchain = halfchain
+        for c in _loop(halfchain) or []:
+            c.patch = self
+
+    def num_subdiv_all(self):
+        return [self.num_subdiv(i) for i in range(self.num_corners())]
+
+    def generate_topology_default(self, num_subdiv=None):
+        """Patch::generate_topology(num_subdiv): default pattern parameter for the boundary.  Returns the
+        parameter, or None when no pattern realizes the boundary (the original asserts there)."""
+        if num_subdiv is None:
+            num_subdiv = self.num_subdiv_all()
+        param = patchgen.get_default_parameter(list(num_subdiv))
+        if param is None:
+            return None
+        self.generate_topology_param(param)
+        return param
+
+    def generate_topology_param(self, param):
+        """Patch::generate_topology(param)."""
+        self.is_failure = False
+        self.param = param
+        patchgen.generate_topology(param, self)
         self.set_halfedgeData()
         self.set_boundary_pn()
         self.invalidate_displist()
@@ -1259,7 +1361,7 @@ class Core:
         echains = [(e.id, rid(e.halfchain[0]), rid(e.halfchain[1]), e.num_subdiv, e.flag) for e in self.edgechains]
         patches = []
         for p in self.patches:
-            patches.append((p.id, rid(p.halfchain), p.is_failure, p.is_hidden, p.flag, p.param.copy(),
+            patches.append((p.id, rid(p.halfchain), p.is_failure, p.is_hidden, p.flag, p.param.copy() if p.param is not None else None,
                             (list(p.v_he), list(p.he_to), list(p.he_next), list(p.he_prev), list(p.he_face),
                              list(p.f_he), p.pn.copy(), list(p.v_corner), list(p.v_tag))))
         return (verts, hes, chains, echains, patches)
@@ -1305,7 +1407,7 @@ class Core:
             p.is_failure = t[2]
             p.is_hidden = t[3]
             p.flag = t[4]
-            p.param = t[5].copy()
+            p.param = t[5].copy() if t[5] is not None else None
             (p.v_he, p.he_to, p.he_next, p.he_prev, p.he_face, p.f_he, pn, p.v_corner, p.v_tag) = (
                 list(t[6][0]), list(t[6][1]), list(t[6][2]), list(t[6][3]), list(t[6][4]), list(t[6][5]),
                 t[6][6], list(t[6][7]), list(t[6][8]))

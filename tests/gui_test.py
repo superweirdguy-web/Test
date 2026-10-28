@@ -154,11 +154,11 @@ def steps():
     yield 0.05
     key('C')
     yield 0.1
-    log('edit topology:', [p.param.l for p in eng.curvenetwork.patches])
+    log('edit topology:', [p.num_subdiv_all() for p in eng.curvenetwork.patches])
     screenshot('02_edit_topology')
 
     # --- edge loop
-    key('S')
+    key('F')
     hover(on_sphere(-0.27, -0.45))
     yield 0.1
     screenshot('03_edge_loop_preview')
@@ -168,7 +168,7 @@ def steps():
     log('edge loop: quads', q0, '->', sum(p.n_faces() for p in eng.curvenetwork.patches))
 
     # --- spine sketching (beside the square)
-    key('W')
+    key('Y')
     drag([on_sphere(0.65, -0.5), on_sphere(0.7, 0.0), on_sphere(0.65, 0.5)])
     yield 0.2
     log('spine: patches', len(eng.curvenetwork.patches))
@@ -191,7 +191,7 @@ def steps():
     screenshot('04_move_vertex_brush')
 
     # --- auto-completion preview along the top of the square
-    key('E')
+    key('U')
     top = [on_sphere(-0.35 + 0.05 * k, s + 0.003) for k in range(10)]
     pts = [to_window(p) for p in top]
     sim('MOUSEMOVE', 'NOTHING', pts[0])

@@ -295,6 +295,11 @@ class SketchRetopoSettings(bpy.types.PropertyGroup):
                                    set=_attr('configTemp.snakes_external')[1])
     snakes_damping: FloatProperty(name='Damping', min=0, max=1, step=10, get=_attr('configTemp.snakes_damping')[0],
                                   set=_attr('configTemp.snakes_damping')[1])
+    snakes_on_ctrl_shift: BoolProperty(name='Ctrl+Shift+Drag Uses Snakes',
+                                       description='Ctrl+Shift+drag smooths curves with geometric snakes (from the '
+                                                   'earlier SketchRetopo) instead of plain smoothing',
+                                       get=_attr('configTemp.snakes_on_ctrl_shift')[0],
+                                       set=_attr('configTemp.snakes_on_ctrl_shift')[1])
 
     # camera
     use_ortho: BoolProperty(name='Ortho', get=_ortho_get, set=_ortho_set, description='Orthographic projection')

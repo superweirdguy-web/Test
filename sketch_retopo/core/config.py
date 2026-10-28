@@ -68,6 +68,8 @@ class ConfigTemp:
         self.snakes_internal2 = 10000000.0
         self.snakes_external = 1.0
         self.snakes_damping = 0.5
+        # extra (not in SketchRetopo2, where Ctrl+Shift+drag smooths like Shift+drag)
+        self.snakes_on_ctrl_shift = False
 
 
 class ConfigSaved:
@@ -94,8 +96,12 @@ class ConfigRender:
         self.show_snake_energy = False
         self.snake_energy_scale = 10.0
         self.auto_camera_center = True
-        self.bgcolor_bottom = (0.25, 0.25, 0.25)
-        self.bgcolor_top = (0.0, 0.0, 0.0)
+        # ConfigRender::Color (SketchRetopo2)
+        self.color_background_bottom = (0.25, 0.25, 0.25)
+        self.color_background_top = (0.0, 0.0, 0.0)
+        self.color_active = (1.0, 0.2, 0.1)
+        self.color_patch = (0.7, 0.7, 0.7)
+        self.color_patch_alpha = 0.2
         self.corner_radius = 0.005
         self.edge_width_interior = 1.0
         self.edge_width_boundary = 2.0

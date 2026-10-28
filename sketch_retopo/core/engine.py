@@ -22,7 +22,8 @@ from .pn import (Polyline, Polyline2d, pn_norm, pn_normalize, pn_normalized, nor
                  project_to_triangle)
 from .curvenetwork import (Core, Patch, alive, voh_iter, vih_iter, voc_iter, pc_iter, ch_iter,
                            set_next_prev, set_vertex_halfedge, trace_halfchains, delete_patch,
-                           delete_halfchain, delete_halfedge, IMAGINARY_SYMMETRY, IMAGINARY_BOUNDARY)
+                           delete_halfchain, delete_halfedge, IMAGINARY_SYMMETRY, IMAGINARY_BOUNDARY,
+                           loop_valid_for_patch, loop_num_corners, loop_num_subdiv, loop_set_default_num_subdiv)
 from .polymesh import find_edgeloop, insert_edgeloop
 from .config import ConfigTemp, ConfigSaved, ConfigRender
 from . import patchgen
@@ -87,7 +88,7 @@ class AutocmplInfo:
 
 
 # state ids (EnumState)
-SKETCH, SPINE, AUTOCMPL, LASER, CYLINDER, DEFORMCURVE, EDITCORNER, EDITTOPOLOGY, EDGELOOP, MOVEVERTEX = range(10)
+SKETCH, SPINE, AUTOCMPL, LASER, CYLINDER, DEFORMCURVE, EDITCORNER, EDITTOPOLOGY, EDGELOOP, MOVEVERTEX, QUERYDB = range(11)
 
 LEFT, RIGHT, MIDDLE = 'LEFT', 'RIGHT', 'MIDDLE'
 
@@ -130,6 +131,8 @@ class Engine:
         self.common_alt_pressed = False
         self.hide_stroke = Polyline2d()
 
+        # data-driven quadrangulation (learnquad.LearnQuad), set by the host when a patch database is loaded
+        self.learnquad = None
         self.material_texture_png_base64 = ''
         self.messages = []                    # (level, text) for the host to report
         self.requests = []                    # host actions requested by keys (save, load, export, ...)
@@ -144,9 +147,10 @@ class Engine:
         self.stateEditTopology = states.StateEditTopology(self)
         self.stateEdgeLoop = states.StateEdgeLoop(self)
         self.stateMoveVertex = states.StateMoveVertex(self)
+        self.stateQueryDB = states.StateQueryDB(self)
         self._states = [self.stateSketch, self.stateSpine, self.stateAutocmpl, self.stateLaser, self.stateCylinder,
                         self.stateDeformCurve, self.stateEditCorner, self.stateEditTopology, self.stateEdgeLoop,
-                        self.stateMoveVertex]
+                        self.stateMoveVertex, self.stateQueryDB]
         self.state = self.stateSketch
         self.state.init()
 
@@ -170,8 +174,6 @@ class Engine:
         self.configTemp.segmentSize.value = bb * ConfigTemp.default_segmentSize_ratio
         Patch.quadSize = self.configTemp.quadSize.value
         self.state.init()
-        if reset_curves:
-            self.trace_basemesh_boundary()
 
     # ---- intersection / projection (SketchRetopo_intersect.cc) --------------------------------
     def intersect(self, pn):
@@ -245,60 +247,70 @@ class Engine:
         return area_max * self.configTemp.loop_threshold_area < area_sum
 
     def generate_patches(self):
+        """Generates a patch for every closed loop of 2-6 corners that has none (SketchRetopo2)."""
         cn = self.curvenetwork
         cn.invalidate_displist()
         cn.set_flag_halfchains('SUBST', 0)
         for c in list(cn.halfchains):
-            if c.is_deleted or c.flag or (c.patch is not None and not c.patch.is_deleted):
+            if c.is_deleted or c.flag or alive(c.patch):
                 continue
-            if c.halfedge_front.imaginary_patch is not None:
-                c.patch = c.halfedge_front.imaginary_patch
+            patch_halfchain = loop_valid_for_patch(c)
+            if patch_halfchain is None:
                 continue
-            c_front, c_back = trace_halfchains(c)
-            if c_front is None or c_back is None:
-                continue
-            num_corners = 0
-            c1 = c_front
-            guard = 0
-            while c1 is not None:
+            c1 = patch_halfchain
+            while True:
                 c1.flag = 1
-                if c1.is_corner():
-                    num_corners += 1
-                if c1 is c_back:
-                    break
                 c1 = c1.next()
-                guard += 1
-                if guard > 100000:
+                if c1 is patch_halfchain:
                     break
-            if c_front.prev() is not c_back or num_corners < 2 or 6 < num_corners:
+            num_corners = loop_num_corners(patch_halfchain)
+            if num_corners < 2 or 6 < num_corners:
+                # don't automatically generate patch if it's not supported by the pattern-based method
                 continue
             polyline = Polyline()
-            c1 = c_front
+            c1 = patch_halfchain
             while True:
                 sub = c1.to_polyline()
                 sub.points.pop()
                 polyline.points.extend(sub.points)
-                if c1 is c_back:
-                    break
                 c1 = c1.next()
+                if c1 is patch_halfchain:
+                    break
             polyline.is_loop = True
             if polyline.length() > self.basemesh.bbox_diagonal_norm() * 2:
+                # loop is too long
                 continue
             if not self.is_loop_ccw(polyline):
+                # doesn't form a reasonable counterclockwise loop
                 continue
-            patch = cn.new_patch()
-            c1 = c_front
-            while True:
-                c1.patch = patch
-                c1 = c1.next()
-                if c1 is c_front or c1 is None:
-                    break
-            patch.halfchain = c_front
-            while not patch.halfchain.is_corner():
-                patch.halfchain = patch.halfchain.next()
-            patch.halfchain = patch.halfchain.next()
-            patch.generate_topology()
-            self.compute_patch_interior_pn(patch)
+            self.generate_patch(patch_halfchain)
+        cn.garbage_collect()
+
+    def generate_patch(self, halfchain):
+        """SketchRetopo::generate_patch: a patch for the loop starting at `halfchain`.  Patterns are used for 2-6
+        corners, the patch database otherwise.  Returns None (and leaves the loop empty) when the boundary has an
+        odd number of edges or no topology is found."""
+        aligned = loop_valid_for_patch(halfchain)
+        if aligned is None:
+            return None
+        halfchain = aligned
+        loop_set_default_num_subdiv(halfchain)
+        num_subdiv = loop_num_subdiv(halfchain)
+        if sum(num_subdiv) % 2 != 0:
+            return None
+        cn = self.curvenetwork
+        patch = cn.new_patch()
+        patch.set_halfchain(halfchain)
+        num_corners = len(num_subdiv)
+        if 2 <= num_corners <= 6:
+            ok = patch.generate_topology_default(num_subdiv) is not None
+        else:
+            ok = self.learnquad is not None and self.learnquad.generate_patch(self, patch, num_subdiv)
+        if not ok:
+            delete_patch(patch)
+            return None
+        self.compute_patch_interior_pn(patch)
+        return patch
 
     def generate_patch_debug(self):
         cn = self.curvenetwork
@@ -313,7 +325,10 @@ class Engine:
             total += ns
         if total % 2:
             patch.halfchain.edgechain.num_subdiv += 1
-        patch.generate_topology()
+        if patch.generate_topology_default() is None:
+            delete_patch(patch)
+            cn.garbage_collect()
+            return
         self.compute_patch_interior_pn(patch)
 
     def _find_snap(self, pn):
@@ -448,42 +463,52 @@ class Engine:
         patch.pn[interior] = values[interior]
         patch.invalidate_displist()
 
-    def compute_patch_interior_pn_harmonic(self, patch, submesh_seed):
-        """Hidden feature (ctrl+click in move-vertex mode): harmonic parameterization of the base mesh
-        region enclosed by the patch boundary.  Geodesic paths are approximated by edge paths."""
-        bm = self.basemesh
+    def patch_boundary_uv(self, patch):
+        """Harmonic uv of the patch boundary vertices: the patch corners on a regular polygon
+        (patchgen::get_boundary_geometry), edges evenly spaced.  Returns {patch vertex: uv}."""
         p_corner0 = patch.patch_corner(0)
-        if p_corner0 < 0 or patch.is_failure:
-            return
-        num_sides = patch.param.get_num_sides()
-        l = patch.param.l
-        n = patch.n_vertices()
-        # step I: harmonic parameterization of the patch
-        fixed = np.array([patch.is_boundary_v(v) for v in range(n)], dtype=bool)
-        vals = np.zeros((n, 2))
+        if p_corner0 < 0:
+            return {}
+        l = patch.num_subdiv_all()
+        num_sides = len(l)
+        out = {}
         p_h = patch.halfedge_handle(p_corner0)
         for i in range(num_sides):
             for j in range(l[i]):
                 t = i + j / float(l[i])
-                vals[patch.from_vertex_handle(p_h)] = patchgen.get_boundary_geometry(num_sides, t)
+                out[patch.from_vertex_handle(p_h)] = np.asarray(patchgen.get_boundary_geometry(num_sides, t), dtype=float)
                 p_h = patch.prev_halfedge_handle(p_h)
-        harmonic_uv = self._laplace_direct(patch, fixed, vals)
+        return out
 
-        # step II: harmonic parameterization of the base mesh region
+    def parameterize_basemesh_under_patch(self, patch, submesh_seed, boundary_uv):
+        """SketchRetopo::parameterize_basemesh_under_patch: harmonic parameterization of the base mesh region
+        enclosed by the patch boundary, constrained by the uv of the patch boundary vertices.  Geodesic paths are
+        approximated by edge paths.  Returns (submesh faces, per-face flood fill flags, per-vertex uv) or None."""
+        bm = self.basemesh
+        p_corner0 = patch.patch_corner(0)
+        if p_corner0 < 0:
+            return None
+        l = patch.num_subdiv_all()
         constraints = []    # (vertices, coords, uv)
         floodfill = np.zeros(len(bm.tris), dtype=bool)
         submesh_faces = []
         p_h = patch.halfedge_handle(p_corner0)
-        for i in range(num_sides):
+        for i in range(len(l)):
             for j in range(l[i]):
                 pv0, pv1 = patch.util_halfedge_to_vertex_pair(p_h ^ 1)
                 hit = self.intersect(patch.pn[pv0])
                 hit_next = self.intersect(patch.pn[pv1])
                 p_h = patch.prev_halfedge_handle(p_h)
-                if hit is None or hit_next is None:
+                if hit is None:
+                    continue
+                uv0 = boundary_uv.get(pv0)
+                uv1 = boundary_uv.get(pv1)
+                if uv0 is None or uv1 is None:
                     continue
                 fv = bm.tris[hit.face]
-                constraints.append((list(fv), [1 - hit.u - hit.v, hit.u, hit.v], harmonic_uv[pv0]))
+                constraints.append((list(fv), [1 - hit.u - hit.v, hit.u, hit.v], uv0))
+                if hit_next is None:
+                    continue
                 pts, path_v = bm.geodesic_path(hit, hit_next)
                 if path_v is None:
                     continue
@@ -492,85 +517,95 @@ class Engine:
                 for k in range(1, len(pts) - 1):
                     acc += norm3(pts[k] - pts[k - 1])
                     t = acc / total
-                    uv = (1 - t) * harmonic_uv[pv0] + t * harmonic_uv[pv1]
                     vtx = path_v[k - 1]
-                    constraints.append(([vtx], [1.0], uv))
+                    constraints.append(([vtx], [1.0], (1 - t) * uv0 + t * uv1))
                     for h in bm.voh(vtx):
                         f = bm.he_face[h]
                         if f >= 0:
                             floodfill[f] = True
                             submesh_faces.append(int(f))
+        # flood fill from the seed face
         limit = max(len(submesh_faces), 1) * 10000
         candidates = [int(submesh_seed)]
         while candidates:
             if limit < len(submesh_faces):
                 self.report('Sub-mesh extraction process does not seem to terminate!', 'WARNING')
-                return
+                return None
             f = candidates.pop()
+            if floodfill[f] and f != submesh_seed:
+                continue
             floodfill[f] = True
             submesh_faces.append(f)
             for ff in bm.face_neighbors(f):
                 if not floodfill[ff]:
                     candidates.append(ff)
-        submesh_faces = sorted(set(submesh_faces))
-        verts = sorted(set(bm.tris[submesh_faces].reshape(-1).tolist()))
-        vtx2var = {v: i for i, v in enumerate(verts)}
+        submesh_faces = np.array(sorted(set(submesh_faces)), dtype=np.int64)
+        verts = np.unique(bm.tris[submesh_faces].reshape(-1))
+        vtx2var = -np.ones(len(bm.verts), dtype=np.int64)
+        vtx2var[verts] = np.arange(len(verts))
         m = len(verts)
+        # cotangent Laplacian restricted to the flood-filled faces
         cot = bm.cotangents()
-        L = np.zeros((m, m))
-        for v in verts:
-            i = vtx2var[v]
-            wsum = 0.0
-            for h in bm.voh(v):
-                w_v = int(bm.he_to[h])
-                j = vtx2var.get(w_v)
-                if j is None:
-                    continue
-                weight = 0.0
-                for hh in (h, int(bm.he_opp[h])):
-                    f = bm.he_face[hh]
-                    if f < 0:
-                        continue
-                    if floodfill[f]:
-                        weight += cot[hh]
-                L[i, j] += weight
-                wsum += weight
-            L[i, i] -= wsum
-        cw = 0.1 * np.abs(L).sum()
-        C = np.zeros((m, m))
+        hs = np.flatnonzero((bm.he_face >= 0))
+        hs = hs[floodfill[bm.he_face[hs]]]
+        a = vtx2var[bm.he_from[hs]]
+        b = vtx2var[bm.he_to[hs]]
+        ok = (a >= 0) & (b >= 0)
+        a, b, w = a[ok], b[ok], cot[hs[ok]]
+        rows = [a, b, a, b]
+        cols = [b, a, a, b]
+        vals = [-w, -w, w, w]           # -L
+        cw = 0.1 * 4 * np.abs(w).sum()
         rhs = np.zeros((m, 2))
         for (vs, coords, uv) in constraints:
-            for k0, v0 in enumerate(vs):
-                i = vtx2var.get(int(v0))
-                if i is None:
+            idx = [int(vtx2var[int(v)]) for v in vs]
+            for k0, i in enumerate(idx):
+                if i < 0:
                     continue
-                for k1, v1 in enumerate(vs):
-                    j = vtx2var.get(int(v1))
-                    if j is None:
+                for k1, j in enumerate(idx):
+                    if j < 0:
                         continue
-                    C[i, j] += cw * coords[k0] * coords[k1]
+                    rows.append(np.array([i]))
+                    cols.append(np.array([j]))
+                    vals.append(np.array([cw * coords[k0] * coords[k1]]))
                 rhs[i] += cw * coords[k0] * np.asarray(uv)
-        A = -L + C
-        try:
-            x = np.linalg.solve(A, rhs)
-        except np.linalg.LinAlgError:
-            x = np.linalg.lstsq(A, rhs, rcond=None)[0]
-        b_uv = {v: x[i] for v, i in vtx2var.items()}
+        x = _solve_sparse_spd(np.concatenate(rows), np.concatenate(cols), np.concatenate(vals), m, rhs)
+        uv = np.zeros((len(bm.verts), 2))
+        uv[verts] = x
+        return submesh_faces, floodfill, uv
+
+    def compute_patch_interior_pn_harmonic(self, patch, submesh_seed):
+        """Hidden feature (ctrl+click in move-vertex mode): places the patch interior vertices by matching the
+        harmonic parameterizations of the patch and of the base mesh region it covers."""
+        bm = self.basemesh
+        if patch.patch_corner(0) < 0 or patch.is_failure:
+            return
+        n = patch.n_vertices()
+        # step I: harmonic parameterization of the patch
+        boundary_uv = self.patch_boundary_uv(patch)
+        fixed = np.array([patch.is_boundary_v(v) for v in range(n)], dtype=bool)
+        vals = np.zeros((n, 2))
+        for v, uv in boundary_uv.items():
+            vals[v] = uv
+        harmonic_uv = self._laplace_direct(patch, fixed, vals)
+        # step II: harmonic parameterization of the base mesh region
+        res = self.parameterize_basemesh_under_patch(patch, submesh_seed, boundary_uv)
+        if res is None:
+            return
+        submesh_faces, floodfill, b_uv = res
         # step III: locate each interior patch vertex by its harmonic uv
         for pv in range(n):
             if fixed[pv]:
                 continue
-            p_uv = harmonic_uv[pv]
-            for f in submesh_faces:
-                a, b, c = bm.tris[f]
-                t = project_to_triangle(b_uv[a], b_uv[b], b_uv[c], p_uv)
-                if t is None or min(t) < 0:
-                    continue
-                pn = t[0] * bm.get_pn(a) + t[1] * bm.get_pn(b) + t[2] * bm.get_pn(c)
-                pn_normalize(pn)
-                self.project(pn)
-                patch.pn[pv] = pn
-                break
+            fbc = _locate_uv(bm.tris[submesh_faces], b_uv, harmonic_uv[pv])
+            if fbc is None:
+                continue
+            k, t = fbc
+            a, b, c = bm.tris[submesh_faces[k]]
+            pn = t[0] * bm.get_pn(a) + t[1] * bm.get_pn(b) + t[2] * bm.get_pn(c)
+            pn_normalize(pn)
+            self.project(pn)
+            patch.pn[pv] = pn
         patch.invalidate_displist()
 
     # ---- suggestive tools ----------------------------------------------------------------------------
@@ -1596,9 +1631,6 @@ class Engine:
                 pn = patch.pn[v]
                 pn[:3] += rbf_wendland(dist[v] / radius) * center_offset
                 self.project(pn)
-                if self.configSaved.symmetric and patch.is_boundary_v(v) and self._on_symmetry_boundary(patch, v):
-                    pn[0] = 0.0
-                    pn[3] = 0.0
             patch.invalidate_displist()
         affected = []
         for v in self.curvenetwork.vertices:
@@ -1822,302 +1854,100 @@ class Engine:
                 h = h.next
 
     # ---- symmetry / boundaries ----------------------------------------------------------------------------
-    def toggle_symmetric(self):
-        """Flips the symmetry mode.  Discards all curves (the caller asks for confirmation)."""
-        cn = self.curvenetwork
+    def set_symmetric(self, value):
+        """SketchRetopo2's "symmetric" option: the other side (X<0) is shown as a mirrored preview and added on
+        export.  Curves are not changed."""
+        self.memento_store()
+        self.configSaved.symmetric = bool(value)
+        self.curvenetwork.invalidate_displist()
+
+    def snap_symmetry(self):
+        """SketchRetopo::snap_symmetry: moves every curve and patch vertex closer than the curve sampling
+        interval to the X=0 plane onto it."""
+        self.memento_store()
+        thr = self.configTemp.segmentSize()
+        for v in self.curvenetwork.vertices:
+            if not v.is_deleted and abs(v.pn[0]) < thr:
+                v.pn[0] = 0.0
+        for p in self.curvenetwork.patches:
+            if p.is_deleted:
+                continue
+            P = p.pn
+            if len(P):
+                P[np.abs(P[:, 0]) < thr, 0] = 0.0
+            p.invalidate_displist()
+        self.curvenetwork.invalidate_displist()
+
+    def basemesh_boundary_halfedge_near(self, pn, max_dist):
+        """Outgoing boundary halfedge of the base mesh boundary vertex closest to pn (within max_dist), or -1."""
         bm = self.basemesh
-        cn.clear()
-        self.memento.init()
-        self.configTemp.autoSave.unsaved = True
-        self.configSaved.symmetric = not self.configSaved.symmetric
+        bnd = np.flatnonzero(bm.he_face < 0)
+        if bnd.size == 0:
+            return -1
+        vs = np.unique(bm.he_from[bnd])
+        d = np.linalg.norm(bm.verts[vs] - np.asarray(pn[:3]), axis=1)
+        k = int(np.argmin(d))
+        if d[k] > max_dist:
+            return -1
+        return int(bm.v_he[vs[k]])
+
+    def trace_basemesh_boundary(self, h_start, keep_exact):
+        """SketchRetopo::trace_basemesh_boundary: adds a curve along the base mesh boundary (hole) containing the
+        boundary halfedge h_start.  keep_exact puts it exactly on the boundary (B), otherwise slightly inside and
+        resampled (N)."""
+        bm = self.basemesh
+        if h_start < 0 or bm.he_face[h_start] >= 0:
+            return
+        self.memento_store()
+        w = (1.0, 0.0, 0.0) if keep_exact else (0.4, 0.4, 0.2)
+        curve = Polyline()
+        h = h_start
+        for _ in range(bm.n_halfedges + 1):
+            v0 = int(bm.he_from[h])
+            v1 = int(bm.he_to[h])
+            v2 = int(bm.he_to[bm.he_next[bm.he_opp[h]]])
+            pn = w[0] * bm.get_pn(v0) + w[1] * bm.get_pn(v1) + w[2] * bm.get_pn(v2)
+            pn_normalize(pn)
+            curve.push_back(pn)
+            h = int(bm.he_next[h])
+            if h == h_start or h < 0:
+                break
+        curve.is_loop = True
         if self.configSaved.symmetric:
-            X = bm.verts[:, 0]
-            hf = bm.he_from
-            ht = bm.he_to
-
-            def is_crossing(h):
-                return X[hf[h]] * X[ht[h]] < 0
-
-            def is_touching(h):
-                a = X[hf[h]]
-                b = X[ht[h]]
-                return a * b == 0 and (a != 0 or b != 0)
-
-            def is_coincide(h):
-                return X[hf[h]] == 0 and X[ht[h]] == 0
-
-            nxt = bm.he_next
-            opp = bm.he_opp
-            edge_visited = np.zeros(bm.n_edges, dtype=bool)
-            candidates = np.flatnonzero((X[hf] * X[ht] < 0) | ((X[hf] == 0) & (X[ht] == 0)))
-            limit = 4 * bm.n_halfedges + 4
-            for h_iter in candidates.tolist():
-                e_idx = bm.he_edge[h_iter]
-                if edge_visited[e_idx]:
+            pts = curve.points
+            if not any(pn[0] >= 0 for pn in pts):
+                return
+            n = len(pts)
+            for k in range(n):
+                pn0 = pts[k]
+                pn1 = pts[(k + 1) % n]
+                if pn0[0] * pn1[0] >= 0:
                     continue
-                edge_visited[e_idx] = True
-                h_start = h_iter
-                is_loop = False
-                h_current = h_start
-                for _ in range(limit):
-                    h_next = -1
-                    if is_coincide(h_current):
-                        v = int(ht[h_current])
-                        for voh in bm.voh(v):
-                            if opp[voh] == h_current:
-                                continue
-                            if is_coincide(voh):
-                                h_next = voh
-                                break
-                            h2 = int(nxt[voh])
-                            if h2 >= 0 and is_crossing(h2):
-                                h_next = h2
-                                break
-                    else:
-                        h_opposite = int(opp[h_current])
-                        if bm.is_boundary_h(h_opposite):
-                            h_start = h_opposite
-                            break
-                        h0 = int(nxt[h_opposite])
-                        h1 = int(nxt[h0])
-                        if is_touching(h0):
-                            v = int(ht[h0])
-                            for voh in bm.voh(v):
-                                if is_coincide(voh):
-                                    h_next = voh
-                                    break
-                                h2 = int(nxt[voh])
-                                if h2 < 0 or opp[h2] == h_current:
-                                    continue
-                                if is_crossing(h2):
-                                    h_next = h2
-                                    break
-                        else:
-                            h_next = h0 if is_crossing(h0) else h1
-                    if h_next == h_start:
-                        is_loop = True
-                        break
-                    if h_next < 0:
-                        h_start = int(opp[h_current])
-                        break
-                    h_current = h_next
-
-                def vertex_by_v(bv):
-                    pn = bm.get_pn(bv)
-                    pn[0] = pn[3] = 0.0
-                    pn_normalize(pn)
-                    pn[:3] += self.configSaved.projOffset * pn[3:]
-                    cv = cn.new_vertex()
-                    cv.pn = pn
-                    return cv
-
-                def vertex_by_h(bh, t):
-                    pn = (1 - t) * bm.get_pn(int(hf[bh])) + t * bm.get_pn(int(ht[bh]))
-                    pn[0] = pn[3] = 0.0
-                    pn_normalize(pn)
-                    pn[:3] += self.configSaved.projOffset * pn[3:]
-                    cv = cn.new_vertex()
-                    cv.pn = pn
-                    return cv
-
-                verts = []
-                if not is_loop:
-                    if is_coincide(h_start):
-                        verts.append(vertex_by_v(int(hf[h_start])))
-                    elif not bm.is_boundary_h(h_start):
-                        hh = int(nxt[h_start])
-                        verts.append(vertex_by_v(int(ht[hh])))
-                h_current = h_start
-                for _ in range(limit):
-                    edge_visited[bm.he_edge[h_current]] = True
-                    h_next = -1
-                    if is_coincide(h_current):
-                        v = int(ht[h_current])
-                        verts.append(vertex_by_v(v))
-                        for voh in bm.voh(v):
-                            if opp[voh] == h_current:
-                                continue
-                            if is_coincide(voh):
-                                h_next = voh
-                                break
-                            h2 = int(nxt[voh])
-                            if h2 >= 0 and is_crossing(h2):
-                                h_next = h2
-                                break
-                    else:
-                        a = X[hf[h_current]]
-                        b = X[ht[h_current]]
-                        t = -a / (b - a)
-                        verts.append(vertex_by_h(h_current, t))
-                        h_opposite = int(opp[h_current])
-                        if bm.is_boundary_h(h_opposite):
-                            break
-                        h0 = int(nxt[h_opposite])
-                        h1 = int(nxt[h0])
-                        if is_touching(h0):
-                            v = int(ht[h0])
-                            for voh in bm.voh(v):
-                                if is_coincide(voh):
-                                    h_next = voh
-                                    break
-                                h2 = int(nxt[voh])
-                                if h2 < 0 or h2 == h_opposite:
-                                    continue
-                                if is_crossing(h2):
-                                    h_next = h2
-                                    break
-                        else:
-                            h_next = h0 if is_crossing(h0) else h1
-                    if h_next < 0:
-                        if not is_coincide(h_current) and not bm.is_boundary_h(h_current):
-                            hh = int(nxt[h_current])
-                            verts.append(vertex_by_v(int(ht[hh])))
-                        break
-                    if h_next == h_start:
-                        break
-                    h_current = h_next
-                if len(verts) < 2:
-                    for cv in verts:
-                        cv.is_deleted = True
-                    continue
-
-                # insert more between each pair of vertices
-                pairs = len(verts) if is_loop else len(verts) - 1
-                dense = []
-                for k in range(len(verts)):
-                    dense.append(verts[k])
-                    if k < pairs:
-                        a = verts[k]
-                        b = verts[(k + 1) % len(verts)]
-                        d = (b.pn - a.pn) / 10.0
-                        pn = a.pn + d
-                        for _ in range(9):
-                            nv_ = cn.new_vertex()
-                            nv_.pn = pn_normalized(pn)
-                            dense.append(nv_)
-                            pn = pn + d
-                verts = dense
-                d = verts[1].pn[:3] - verts[0].pn[:3]
-                if cross3(d, verts[0].pn[3:])[0] < 0:
-                    verts.reverse()
-                fwd = []
-                bwd = []
-                pairs = len(verts) if is_loop else len(verts) - 1
-                for k in range(pairs):
-                    v0 = verts[k]
-                    v1 = verts[(k + 1) % len(verts)]
-                    h01 = cn.new_halfedge()
-                    h10 = cn.new_halfedge()
-                    set_vertex_halfedge(v0, v1, h01, h10)
-                    fwd.append(h01)
-                    bwd.append(h10)
-                    h01.imaginary_patch = IMAGINARY_SYMMETRY
-                nh = len(fwd)
-                for k in range(nh):
-                    fwd[k].next = None if (not is_loop and k == nh - 1) else fwd[(k + 1) % nh]
-                    fwd[k].prev = None if (not is_loop and k == 0) else fwd[(k + nh - 1) % nh]
-                    bwd[k].prev = None if (not is_loop and k == nh - 1) else bwd[(k + 1) % nh]
-                    bwd[k].next = None if (not is_loop and k == 0) else bwd[(k + nh - 1) % nh]
-            cn.garbage_collect()
-        self.trace_basemesh_boundary()
-        cn.invalidate_displist()
-
-    def trace_basemesh_boundary(self):
-        cn = self.curvenetwork
-        bm = self.basemesh
-        visited = np.zeros(bm.n_halfedges, dtype=bool)
-        boundary = np.flatnonzero(bm.he_face < 0)
-        for h in boundary.tolist():
-            if visited[h]:
-                continue
-            curve = []
-            i = h
-            for _ in range(bm.n_halfedges + 1):
-                visited[i] = True
-                curve.append(bm.get_pn(int(bm.he_from[i])))
-                i = int(bm.he_next[i])
-                if i == h or i < 0:
+                t = -pn0[0] / (pn1[0] - pn0[0])
+                pn = (1 - t) * pn0 + t * pn1
+                pn[0] = pn[3] = 0.0
+                pn_normalize(pn)
+                pts[k] = pn
+            rotate_pos = -1
+            for k in range(n):
+                kp = n - 1 if k == 0 else k - 1
+                if pts[kp][0] < 0 and pts[k][0] >= 0:
+                    rotate_pos = k
                     break
-            is_symmetric_open = False
-            if self.configSaved.symmetric:
-                if all(pn[0] < 0 for pn in curve):
-                    continue
-                n = len(curve)
-                for k in range(n):
-                    pn0 = curve[k]
-                    pn1 = curve[(k + 1) % n]
-                    if pn0[0] * pn1[0] >= 0:
-                        continue
-                    t = -pn0[0] / (pn1[0] - pn0[0])
-                    pn = (1 - t) * pn0 + t * pn1
-                    pn[0] = pn[3] = 0.0
-                    pn_normalize(pn)
-                    curve[k] = pn
-                rotate_pos = -1
-                for k in range(n):
-                    kp = n - 1 if k == 0 else k - 1
-                    if curve[kp][0] < 0 and curve[k][0] >= 0:
-                        rotate_pos = k
-                        break
-                if rotate_pos != -1:
-                    curve = curve[rotate_pos:] + curve[:rotate_pos]
-                    curve = [pn for pn in curve if pn[0] >= 0]
-                    is_symmetric_open = True
-            for pn in curve:
-                pn[:3] += self.configSaved.projOffset * pn[3:]
-            n = len(curve)
-            if n < 2:
-                continue
-            verts = []
-            for k in range(n):
-                pn = curve[k]
-                if is_symmetric_open and (k == 0 or k == n - 1):
-                    best = None
-                    best_d = float('inf')
-                    for v in cn.vertices:
-                        d = float(np.linalg.norm(pn - v.pn))
-                        if d < best_d:
-                            best_d = d
-                            best = v
-                    verts.append(best)
-                else:
-                    v = cn.new_vertex()
-                    v.pn = pn.copy()
-                    verts.append(v)
-            if is_symmetric_open and (verts[0] is None or verts[-1] is None or verts[0].halfedge is None or verts[-1].halfedge is None):
-                continue
-            fwd = []
-            bwd = []
-            for k in range(n):
-                if is_symmetric_open and k == n - 1:
-                    continue
-                v0 = verts[k]
-                v1 = verts[k + 1 if k < n - 1 else 0]
-                h01 = cn.new_halfedge()
-                h10 = cn.new_halfedge()
-                if is_symmetric_open and k == 0:
-                    set_next_prev(v0.halfedge.opposite, h01)
-                    set_next_prev(h10, v0.halfedge)
-                    h01.prev.is_corner = True
-                    h10.is_corner = True
-                elif is_symmetric_open and k == n - 2:
-                    set_next_prev(h01, v1.halfedge)
-                    set_next_prev(v1.halfedge.opposite, h10)
-                    h01.is_corner = True
-                    h10.prev.is_corner = True
-                set_vertex_halfedge(v0, v1, h01, h10)
-                fwd.append(h01)
-                bwd.append(h10)
-                h01.imaginary_patch = IMAGINARY_BOUNDARY
-            nh = len(fwd)
-            for k in range(nh):
-                if not (is_symmetric_open and k == nh - 1):
-                    fwd[k].next = fwd[(k + 1) % nh]
-                    bwd[k].prev = bwd[(k + 1) % nh]
-                if not (is_symmetric_open and k == 0):
-                    fwd[k].prev = fwd[(k + nh - 1) % nh]
-                    bwd[k].next = bwd[(k + nh - 1) % nh]
-        cn.generate_halfchains()
+            if rotate_pos != -1:
+                pts = pts[rotate_pos:] + pts[:rotate_pos]
+                curve.points = [pn for pn in pts if pn[0] >= 0]
+                curve.is_loop = False
+        if not keep_exact:
+            curve.resample_by_length(self.configTemp.segmentSize())
+        for pn in curve.points:
+            pn[:3] += self.configSaved.projOffset * pn[3:]
+        if curve.size() < 2:
+            return
+        if curve.is_loop:
+            self.curvenetwork.add_curve_loop(curve)
+        else:
+            self.add_curve_open_delegate(curve, False)
         self.generate_patches()
 
     # ---- geodesic (approximation of the exact geodesic used by the original) ----------------------------
@@ -2187,7 +2017,7 @@ class Engine:
             self.hide_stroke.push_back((mouse_x, mouse_y))
             return True
         curve_level = self.state.edit_level == 'CURVE_NETWORK'
-        if button == LEFT and shift and ctrl and curve_level:
+        if button == LEFT and shift and ctrl and curve_level and ct.snakes_on_ctrl_shift:
             self.common_dragMode = 'Snakes'
             self.memento_store()
             return True
@@ -2236,14 +2066,10 @@ class Engine:
                     if patch is None or patch.is_imaginary():
                         continue
                     affected_patches.append(patch)
-            affected_patches = _unique(affected_patches)
-            for patch in affected_patches:
-                if not patch.is_deleted:
-                    patch.clear()
-            for patch in affected_patches:
+            for patch in _unique(affected_patches):
                 if patch.is_deleted:
                     continue
-                patch.generate_topology(False)
+                patch.set_boundary_pn()
                 self.compute_patch_interior_pn(patch)
             self.curvenetwork.invalidate_displist()
             self.common_affected_edgechains = []
@@ -2357,8 +2183,9 @@ class Engine:
             self.common_sketch_curve.push_back(pn_mouse)
         return False
 
-    MODE_KEYS = {'q': SKETCH, 'w': SPINE, 'e': AUTOCMPL, 'r': LASER, 't': CYLINDER, 'y': DEFORMCURVE,
-                 'f': EDITCORNER, 'a': EDITTOPOLOGY, 's': EDGELOOP, 'd': MOVEVERTEX}
+    # SketchRetopo2's layout; spine sketching and auto-completion (from the earlier SketchRetopo) on Y and U
+    MODE_KEYS = {'q': SKETCH, 'w': DEFORMCURVE, 'e': LASER, 'r': CYLINDER, 't': EDITCORNER,
+                 'a': EDITTOPOLOGY, 's': QUERYDB, 'd': MOVEVERTEX, 'f': EDGELOOP, 'y': SPINE, 'u': AUTOCMPL}
 
     def common_keyboard(self, key):
         """`key` is a character as GLUT delivers it ('B' for shift+b) or a control name such as 'ctrl+z'."""
@@ -2491,6 +2318,9 @@ class Engine:
         new = self._states[enum_state]
         if new is self.state:
             return
+        exit_state = getattr(self.state, 'exit', None)
+        if exit_state is not None:
+            exit_state()
         self.state = new
         self.state.init()
 
@@ -2537,6 +2367,75 @@ class Engine:
         V = np.array(verts, dtype=float).reshape(-1, 3)
         threshold = (self.basemesh.bbox_diagonal_norm() if self.basemesh else 1.0) * 0.0000001
         return merge_nearby_vertices(V, faces, threshold)
+
+
+def _solve_sparse_spd(rows, cols, vals, n, rhs, tol=1e-10, max_iter=None):
+    """Solves A x = rhs for a symmetric positive (semi)definite sparse A given as triplets (duplicates summed).
+    Dense solve for small systems, Jacobi-preconditioned conjugate gradients otherwise."""
+    if n == 0:
+        return np.zeros((0,) + rhs.shape[1:])
+    if n <= 1500:
+        A = np.zeros((n, n))
+        np.add.at(A, (rows, cols), vals)
+        try:
+            return np.linalg.solve(A, rhs)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(A, rhs, rcond=None)[0]
+    order = np.lexsort((cols, rows))
+    rows, cols, vals = rows[order], cols[order], vals[order]
+    diag = np.zeros(n)
+    np.add.at(diag, rows[rows == cols], vals[rows == cols])
+    diag[np.abs(diag) < 1e-30] = 1.0
+
+    def matvec(x):
+        y = np.zeros_like(x)
+        np.add.at(y, rows, vals[:, None] * x[cols])
+        return y
+    b = rhs.reshape(n, -1)
+    x = b / diag[:, None]
+    r = b - matvec(x)
+    z = r / diag[:, None]
+    p = z.copy()
+    rz = (r * z).sum(0)
+    bnorm = np.sqrt((b * b).sum(0)) + 1e-300
+    for _ in range(max_iter or 10 * n):
+        Ap = matvec(p)
+        alpha = rz / np.maximum((p * Ap).sum(0), 1e-300)
+        x += alpha * p
+        r -= alpha * Ap
+        if np.all(np.sqrt((r * r).sum(0)) <= tol * bnorm):
+            break
+        z = r / diag[:, None]
+        rz_new = (r * z).sum(0)
+        p = z + (rz_new / np.maximum(rz, 1e-300)) * p
+        rz = rz_new
+    return x.reshape(rhs.shape)
+
+
+def _locate_uv(tris, uv, p):
+    """Index of the first triangle (rows of `tris`, uv per vertex) containing uv point p, and its barycentric
+    coordinates; None if outside."""
+    A = uv[tris[:, 0]]
+    B = uv[tris[:, 1]]
+    C = uv[tris[:, 2]]
+    v0 = B - A
+    v1 = C - A
+    v2 = np.asarray(p) - A
+    d00 = (v0 * v0).sum(1)
+    d01 = (v0 * v1).sum(1)
+    d11 = (v1 * v1).sum(1)
+    d20 = (v2 * v0).sum(1)
+    d21 = (v2 * v1).sum(1)
+    den = d00 * d11 - d01 * d01
+    with np.errstate(divide='ignore', invalid='ignore'):
+        v = (d11 * d20 - d01 * d21) / den
+        w = (d00 * d21 - d01 * d20) / den
+    u = 1 - v - w
+    ok = np.flatnonzero((den != 0) & (u >= 0) & (v >= 0) & (w >= 0))
+    if ok.size == 0:
+        return None
+    k = int(ok[0])
+    return k, (float(u[k]), float(v[k]), float(w[k]))
 
 
 class _HalfedgeSequence:

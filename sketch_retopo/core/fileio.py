@@ -1,6 +1,9 @@
-# Port of SketchRetopo_fileio.cc: the XML session format (version 1) of the
-# original program (base mesh, configuration, curve network with patches,
+# Port of SketchRetopo_fileio.cc: the XML session format (base mesh, configuration, curve network with patches,
 # material texture), plus simple OBJ/OFF/PLY/STL writers for the retopo mesh.
+#
+# Files are written in SketchRetopo2's format (no version attribute, halfedges without the imaginary patch
+# column, patches without pattern parameters), so SketchRetopo2 can open them.  Files of the earlier SketchRetopo
+# release (version="1") can be read as well.
 
 import xml.etree.ElementTree as ET
 
@@ -10,7 +13,8 @@ from .curvenetwork import Core, Patch, IMAGINARY_SYMMETRY, IMAGINARY_BOUNDARY, d
 from .config import ConfigSaved
 from . import patchgen
 
-XML_VERSION = 1
+# files of the earlier SketchRetopo release carry version="1"; SketchRetopo2 writes no version
+XML_VERSION_EARLIER = 1
 
 
 def _fmt(x):
@@ -40,7 +44,7 @@ def session_to_string(engine, basemesh_verts=None, basemesh_tris=None):
 
 
 def build_xml(engine, basemesh_verts, basemesh_tris, basemesh_uvs=None):
-    root = ET.Element('sketchretopo', {'version': str(XML_VERSION)})
+    root = ET.Element('sketchretopo')
     has_texture = basemesh_uvs is not None
     xb = ET.SubElement(root, 'basemesh', {'has_texture': '1' if has_texture else '0'})
     xv = ET.SubElement(xb, 'vertices', {'num': str(len(basemesh_verts))})
@@ -63,45 +67,58 @@ def build_xml(engine, basemesh_verts, basemesh_tris, basemesh_uvs=None):
     cn = engine.curvenetwork
 
     def rid(x):
-        return x.id if x is not None else -1
+        return x.id if x is not None and not x.is_deleted else -1
 
+    def live(elems):
+        return [x for x in elems if not x.is_deleted]
+
+    vertices, halfedges = live(cn.vertices), live(cn.halfedges)
+    halfchains, edgechains, patches = live(cn.halfchains), live(cn.edgechains), live(cn.patches)
     xc = ET.SubElement(root, 'curvenetwork')
-    e = ET.SubElement(xc, 'vertices', {'num': str(len(cn.vertices))})
-    e.text = '\n' + ''.join('%d %d %s\n' % (v.id, rid(v.halfedge), ' '.join(_fmt(x) for x in v.pn)) for v in cn.vertices)
+    e = ET.SubElement(xc, 'vertices', {'num': str(len(vertices))})
+    e.text = '\n' + ''.join('%d %d %s\n' % (v.id, rid(v.halfedge), ' '.join(_fmt(x) for x in v.pn)) for v in vertices)
     e.append(ET.Comment('id halfedge px py pz nx ny nz'))
-    e = ET.SubElement(xc, 'halfedges', {'num': str(len(cn.halfedges))})
-    e.text = '\n' + ''.join('%d %d %d %d %d %d %d %d\n' % (
-        h.id, rid(h.vertex), rid(h.next), rid(h.prev), rid(h.opposite), rid(h.halfchain), 1 if h.is_corner else 0,
-        h.imaginary_patch.id if h.imaginary_patch is not None else -1) for h in cn.halfedges)
-    e.append(ET.Comment('id vertex next prev opposite halfchain is_corner imaginary_patch_id'))
-    e = ET.SubElement(xc, 'halfchains', {'num': str(len(cn.halfchains))})
-    e.text = '\n' + ''.join('%d %d %d %d %d\n' % (c.id, rid(c.halfedge_front), rid(c.halfedge_back), rid(c.patch),
-                                                  rid(c.edgechain)) for c in cn.halfchains)
+    e = ET.SubElement(xc, 'halfedges', {'num': str(len(halfedges))})
+    e.text = '\n' + ''.join('%d %d %d %d %d %d %d\n' % (
+        h.id, rid(h.vertex), rid(h.next), rid(h.prev), rid(h.opposite), rid(h.halfchain), 1 if h.is_corner else 0)
+        for h in halfedges)
+    e.append(ET.Comment('id vertex next prev opposite halfchain is_corner'))
+    e = ET.SubElement(xc, 'halfchains', {'num': str(len(halfchains))})
+    e.text = '\n' + ''.join('%d %d %d %d %d\n' % (c.id, rid(c.halfedge_front), rid(c.halfedge_back),
+                                                  rid(c.patch) if c.patch is not None and c.patch.id >= 0 else -1,
+                                                  rid(c.edgechain)) for c in halfchains)
     e.append(ET.Comment('id halfedge_front halfedge_back patch edgechain'))
-    e = ET.SubElement(xc, 'edgechains', {'num': str(len(cn.edgechains))})
+    e = ET.SubElement(xc, 'edgechains', {'num': str(len(edgechains))})
     e.text = '\n' + ''.join('%d %d %d %d\n' % (ec.id, rid(ec.halfchain[0]), rid(ec.halfchain[1]), ec.num_subdiv)
-                            for ec in cn.edgechains)
+                            for ec in edgechains)
     e.append(ET.Comment('id halfchain_0 halfchain_1 num_subdiv'))
-    xp = ET.SubElement(xc, 'patches', {'num': str(len(cn.patches))})
-    for p in cn.patches:
-        xpp = ET.SubElement(xp, 'patch', {'id': str(p.id), 'halfchain': str(rid(p.halfchain)),
-                                          'is_failure': '1' if p.is_failure else '0'})
-        param = p.param
-        ns = param.get_num_sides()
-        xparam = ET.SubElement(xpp, 'param', {'num_sides': str(ns), 'pattern_id': str(param.pattern_id),
-                                              'permutation_id': str(param.permutation.id)})
-        ET.SubElement(xparam, 'l').text = ''.join('%d ' % x for x in param.l)
-        nvar = patchgen.get_num_variables(ns, param.pattern_id) if 2 <= ns <= 6 and param.pattern_id >= 0 else 0
-        ET.SubElement(xparam, 'variable').text = ''.join(
-            '%d ' % patchgen.get_variable(ns, param.pattern_id, param, i) for i in range(nvar))
+    xp = ET.SubElement(xc, 'patches', {'num': str(len(patches))})
+    for p in patches:
+        xpp = ET.SubElement(xp, 'patch', {'id': str(p.id), 'halfchain': str(rid(p.halfchain))})
         xpv = ET.SubElement(xpp, 'patch_vertices', {'num': str(p.n_vertices())})
         xpv.text = '\n' + ''.join('%s %d %d\n' % (' '.join(_fmt(x) for x in p.pn[v]), p.v_corner[v], p.v_tag[v])
                                   for v in p.vertices())
         xpv.append(ET.Comment('px py pz nx ny nz corner_index tag'))
         xpf = ET.SubElement(xpp, 'patch_faces', {'num': str(p.n_faces())})
         xpf.text = '\n' + ''.join(' '.join(str(v) for v in p.fv(f)) + ' \n' for f in p.faces())
-    ET.SubElement(root, 'texture').text = engine.material_texture_png_base64 or ''
+    # SketchRetopo2 always stores a material and cannot read an empty <texture> element
+    ET.SubElement(root, 'texture').text = engine.material_texture_png_base64 or default_material_base64()
     return root
+
+
+_DEFAULT_MATERIAL = []
+
+
+def default_material_base64():
+    """The original program's default material (resource/material_default), PNG encoded with base64."""
+    if not _DEFAULT_MATERIAL:
+        import base64
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'resources',
+                            'sketchretopo_matcap.png')
+        with open(path, 'rb') as f:
+            _DEFAULT_MATERIAL.append(base64.b64encode(f.read()).decode('ascii'))
+    return _DEFAULT_MATERIAL[0]
 
 
 def _numbers(text, cast=float):
@@ -174,14 +191,13 @@ def parse_xml_root(root, fname):
         n = int(e.get('num'))
         vals_ = _numbers(e.text, int)
         refs_h = []
+        # version 1 (earlier SketchRetopo) has an imaginary patch column; curves along the symmetry plane and the
+        # base mesh boundaries are ordinary curves here, as in SketchRetopo2
+        cols = 8 if version >= 1 else 7
         for i in range(n):
-            t = vals_[8 * i: 8 * i + 8]
+            t = vals_[cols * i: cols * i + cols]
             h = Halfedge(t[0])
             h.is_corner = t[6] != 0
-            if t[7] == -2:
-                h.imaginary_patch = IMAGINARY_SYMMETRY
-            elif t[7] == -3:
-                h.imaginary_patch = IMAGINARY_BOUNDARY
             cn.halfedges.append(h)
             hmap[h.id] = h
             refs_h.append((h, t))
@@ -211,8 +227,8 @@ def parse_xml_root(root, fname):
         if xps is not None:
             for xpp in xps.findall('patch'):
                 p = Patch(int(xpp.get('id')))
-                p.is_failure = int(xpp.get('is_failure', '0')) != 0
-                if version >= 1:
+                is_failure = int(xpp.get('is_failure', '0')) != 0
+                if xpp.find('param') is not None:
                     xparam = xpp.find('param')
                     ns = int(xparam.get('num_sides'))
                     p.param.pattern_id = int(xparam.get('pattern_id'))
@@ -239,13 +255,9 @@ def parse_xml_root(root, fname):
                     p.add_face(pf[4 * i: 4 * i + 4])
                 cn.patches.append(p)
                 pmap[p.id] = p
-                refs_p.append((p, int(xpp.get('halfchain'))))
+                refs_p.append((p, int(xpp.get('halfchain')), is_failure))
 
         def patch_ref(pid):
-            if pid == -2:
-                return IMAGINARY_SYMMETRY
-            if pid == -3:
-                return IMAGINARY_BOUNDARY
             return pmap.get(pid)
 
         for v, hid in refs_v:
@@ -263,14 +275,21 @@ def parse_xml_root(root, fname):
             c.edgechain = emap.get(t[4])
         for ec, t in refs_e:
             ec.halfchain = [cmap.get(t[1]), cmap.get(t[2])]
-        for p, cid in refs_p:
+        regenerate = []
+        for p, cid, is_failure in refs_p:
             p.halfchain = cmap.get(cid)
+            if is_failure or p.n_faces() == 0 or p.halfchain is None:
+                # SketchRetopo2 has no failure patches: the loop is left empty (or generated again below)
+                regenerate.append(p)
+                continue
+            if p.param.pattern_id < 0:
+                p.param = None
             p.set_halfedgeData()
+        for p in regenerate:
+            delete_patch(p)
         engine.curvenetwork = cn
-        if version < 1:
-            for p in cn.patches:
-                delete_patch(p)
-            cn.garbage_collect()
+        cn.garbage_collect()
+        if regenerate:
             engine.generate_patches()
         engine.memento.init()
         engine.configSaved = config

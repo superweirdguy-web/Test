@@ -1,19 +1,24 @@
 # SketchRetopo for Blender
 
-A Blender add-on that ports **SketchRetopo**, the sketch-based quad retopology prototype by
-Kenshi Takayama, Daniele Panozzo, Alexander Sorkine-Hornung and Olga Sorkine-Hornung:
+A Blender add-on that ports **SketchRetopo2**, the sketch-based quad retopology program by
+Kenshi Takayama and co-authors (the demo distributed on the project page, version of October 2017):
 
-> *Sketch-Based Generation and Editing of Quad Meshes*, ACM Transactions on Graphics 32(4), SIGGRAPH 2013.
-> Project page: <https://igl.ethz.ch/projects/sketch-retopo/>
+> *Sketch-Based Generation and Editing of Quad Meshes*, Takayama, Panozzo, Sorkine-Hornung, Sorkine-Hornung,
+> ACM Transactions on Graphics 32(4), SIGGRAPH 2013. Project page: <https://igl.ethz.ch/projects/sketch-retopo/>
+>
+> *Data-Driven Interactive Quadrangulation*, Marcias, Takayama, Pietroni, Panozzo, Sorkine-Hornung, Puppo,
+> Cignoni, ACM Transactions on Graphics 34(4), SIGGRAPH 2015.
 
 You sketch curves directly on a high-resolution mesh. Whenever curves enclose a region with 2–6 corners,
 a quad patch is generated immediately with the pattern-based quadrangulation of
 *Pattern-Based Quadrangulation for N-Sided Patches* (Takayama et al., SGP 2014). You then refine the
 topology (edge counts, irregular vertices, T-junctions, edge loops) and export a clean quad mesh.
 
-The add-on is a line-by-line port of the original C++ source (SketchRetopo + patchgen). All ten
-editing modes, the shortcuts, the snapping and T-junction rules, the patch patterns, undo/redo,
-symmetry, and the XML file format behave like the original program.
+The add-on is a line-by-line port of the original C++ source (SketchRetopo2 + patchgen). The editing
+modes, the shortcuts, the snapping and T-junction rules, the patch patterns, undo/redo, symmetry and the
+XML file format behave like the original program, and its XML files open in SketchRetopo2 (and vice
+versa). Spine sketching and auto-completion, which the earlier SketchRetopo release had, are kept on the
+spare keys `Y` and `U`.
 
 ## Installation
 
@@ -52,7 +57,7 @@ Most operations use the left mouse button.
 | `Ctrl` + right drag | Default quad size for new patches |
 | `Ctrl+Shift` + right drag | Curve sampling interval |
 | `Shift` + drag *(curve modes)* | Smooth a curve |
-| `Ctrl+Shift` + drag *(curve modes)* | Smooth a curve with geometric snakes |
+| `Ctrl+Shift` + drag *(curve modes)* | Smooth a curve (or with geometric snakes, if enabled in the *Snakes* panel) |
 | `Space` | Toggle quad-mesh-only rendering |
 | `Ctrl+B` | Toggle base-mesh-only rendering |
 | Hold `H` + drag | Hide the base mesh on one side of the stroke; `H` + click unhides |
@@ -72,16 +77,20 @@ Most operations use the left mouse button.
 
 | Key | Mode | How to use |
 | --- | --- | --- |
-| `Q` | **Basic sketching** | Drag to draw a curve. Crossings become corners (red), ends close to green endpoints snap, ends close to a curve make a T-junction (blue). A region bounded by 2–6 corners becomes a patch (patches are colored by their number of sides). `Ctrl`+drag from an endpoint extends the curve without a corner. Hold `C` and drag to erase crossed curves. `G` erases every open-ended curve. Hold `Z` and click to rebuild the curve network around the clicked spot. |
-| `W` | **Spine sketching** | Draw a single stroke; a strip of quads is created around it. Right-drag sets the width (blue sphere). Ends near a curve snap orthogonally; strokes running along a patch boundary snap in parallel (and may stop half way, creating T-junctions). |
-| `E` | **Auto-completion** | Drag along the boundary of existing patches: a green preview appears. Release to freeze it, click anywhere to accept. `Z`/`X` browse alternatives (largest first), `C` prefers a triangle in concave areas. Right-drag sets the maximum size. |
-| `R` | **Laser cutting** | Drag a line (purple). The base mesh is cut by the plane through the line and the eye; the intersection curve is traced from the line's start point. |
-| `T` | **Cylinder sketching** | Draw a curve connecting two loops (typically from laser cuts). Three more curves are generated around the cylinder. If a loop has corners, the other must have none or the same number, and the stroke must end on corners. |
-| `Y` | **Deform curves** | Drag a corner or endpoint, or drag the middle of a curve. Released corners/endpoints snap to nearby curves. `Ctrl`+drag oversketches a curve between two of its points. |
-| `F` | **Corner editing** | Drag from inside a patch to one of its corners to toggle corner / T-junction. `Ctrl`+click on a curve creates a corner, or erases a corner with two curves. |
-| `A` | **Topology editing** | Click a patch boundary curve to select it (red); `Shift`+click toggles, `Ctrl`+click selects every curve along the same quad strip. `X`/`C` change the number of edges by −2/+2, `Z`/`V` by −1/+1 (the total around a patch must stay even). Click inside a patch to select it: on 4-sided patches drag to move the irregular vertices; on other patches click the arrows and use `Z`/`X` (decrease) or `C`/`V` (increase) the selected parameter; `B`/`Shift+B` switch to the next/previous pattern. Patches that cannot be quadrangulated are black with blue points along their boundary. |
-| `S` | **Edge loop insertion** | Hover a patch boundary to preview the edge loop (green), click to insert it. |
-| `D` | **Move vertices** | Drag to move quad vertices with a smooth falloff (yellow sphere = brush, right-drag to resize). `Shift`+drag smooths. `G` applies one step of global smoothing. |
+| `Q` | **Basic sketching** | Drag to draw a curve. Crossings become corners (red), ends close to green endpoints snap, ends close to a curve make a T-junction (blue). A region bounded by 2–6 corners becomes a patch. `Ctrl`+drag from an endpoint extends the curve without a corner. Hold `C` and drag to erase the curves crossed. Hold `X` and drag from a curve into an empty region to create its patch (also for regions that are not filled automatically). Hold `V` and click a patch to delete it (its curves stay). Hold `B` and click near an edge of a hole in the base mesh to add a curve along it (`N`: slightly inside the hole, resampled). Hold `Z` and click to join the curves around the clicked spot. `G` erases every open-ended curve. |
+| `W` | **Deform curves** | Drag a corner or endpoint, or drag the middle of a curve. Released corners/endpoints snap to nearby curves. `Ctrl`+drag oversketches a curve between two of its points. |
+| `E` | **Laser sketching** | Drag a line. The base mesh is cut by the plane through the line and the eye; the intersection curve is traced from the line's start point (e.g. a loop around an arm). |
+| `R` | **Cylinder sketching** | Draw a curve connecting two loops (typically from laser cuts). More curves are generated around the cylinder. If a loop has corners, the other must have none or the same number, and the stroke must end on corners. |
+| `T` | **Corner editing** | Drag from inside a patch to one of its corners to toggle corner / T-junction for that patch (a corner shows red on the patches it is a corner of, blue where it is a T-junction). `Ctrl`+click on a curve creates a corner, or removes a corner joining two curves. |
+| `A` | **Topology editing** | Click a curve to select it (red); its number of edges is shown. `Shift`+click toggles, `Ctrl`+click selects every curve across the same quad strip. `C`/`X` change the number of edges by +2/−2, `V`/`Z` by +1/−1 (a patch needs an even total, so a single ±1 leaves the region empty until another curve is changed and you sketch again or use `X`+drag). Click inside a patch to select it (it gets its default layout): on 4-sided patches drag to move the poles; on other patches click an arrow and use `Z`/`X` (decrease) or `C`/`V` (increase), `B`/`Shift+B` switch to the next/previous pattern. Curves without patches show their edges as blue points. |
+| `S` | **Query database** | Click a patch, then drag flow strokes inside it (`Shift`+drag adds more). Layouts matching the boundary and the flow are looked up in the patch database (`patches.db`, see below); `Z`/`X` show the previous/next result. |
+| `D` | **Move vertices** | Drag to move quad vertices with a smooth falloff (yellow sphere = brush, right-drag to resize). `Shift`+drag smooths. `Ctrl`+click a patch relaxes it over the surface. `G` applies one step of global smoothing. |
+| `F` | **Edge loop insertion** | Hover a patch boundary to preview the edge loop, click to insert it. |
+| `Y` | Spine sketching *(earlier SketchRetopo)* | Draw a single stroke; a strip of quads is created around it. Right-drag sets the width. |
+| `U` | Auto-completion *(earlier SketchRetopo)* | Drag along the boundary of existing patches: a preview appears. Release to freeze it, click anywhere to accept. `Z`/`X` browse alternatives, `C` prefers a triangle. |
+
+The keys only apply while a session runs and the mouse is over the 3D viewport; `Esc` ends the session
+and Blender's own shortcuts apply again.
 
 ## Sidebar options
 
@@ -89,9 +98,9 @@ Most operations use the left mouse button.
   autosave (every *n* seconds once the sketch has a file name; `name.N.xml` files are numbered
   `name.N+1.xml` like the original), load a PNG MatCap as the base mesh material, or use the
   original SketchRetopo MatCap.
-* **Symmetric (X=0)** – the base mesh is treated as symmetric about its local X=0 plane: only the
-  X>0 side is edited and the other side is mirrored (and merged on export). Toggling discards all
-  curves, so do it right after starting.
+* **Symmetric (X=0)** – the other side of the base mesh's local X=0 plane is shown as a mirrored preview and
+  added to the exported mesh. **Snap Symmetry** moves curve and quad vertices lying closer to X=0 than the
+  curve sampling interval onto the plane, so the two halves join when exported.
 * **Config** – projection offset (distance of curves/quads above the surface), snapping radius, default
   quad size, curve sampling, brush sizes, undo buffer size, auto-completion preview interval, number
   of cylinder curves, even edge counts, loop detection thresholds.
@@ -103,9 +112,9 @@ Most operations use the left mouse button.
 
 ## Files
 
-* **XML** – the format of the original program (version 1): base mesh, configuration, curve network,
-  patches and material. Files saved by the original SketchRetopo can be loaded (the base mesh is created
-  as a new object), and files saved here can be opened by the original program.
+* **XML** – SketchRetopo2's format: base mesh, configuration, curve network, patches and material. Files
+  saved by SketchRetopo2 (and by the earlier SketchRetopo) can be loaded (the base mesh is created as a new
+  object), and files saved here open in SketchRetopo2.
 * **.blend** – sessions are stored in text blocks named `SketchRetopo:<object>` when you save, and
   restored the next time you start SketchRetopo on that object.
 
@@ -133,6 +142,8 @@ The behavior follows the C++ source; these parts necessarily differ:
   the original).
 * **Robustness.** A few situations that crash or hang the original (for example a boundary whose edge counts
   admit no pattern, or a laser plane passing exactly through mesh vertices) are handled gracefully.
+* **Sizes on screen.** The snapping radius, brushes and corner markers scale with the view as in the
+  original (whose camera has a 40° field of view), so they look the same size on screen.
 
 ## Development
 
@@ -161,7 +172,8 @@ xvfb-run -a -s "-screen 0 1600x1000x24" blender --enable-event-simulate --python
 
 ## License and credits
 
-SketchRetopo and patchgen are © Kenshi Takayama and co-authors (ETH Zurich, Interactive Geometry Lab).
+SketchRetopo, SketchRetopo2 and patchgen are © Kenshi Takayama and co-authors (ETH Zurich, Interactive Geometry
+Lab); the data-driven quadrangulation is © Giorgio Marcias and co-authors (ISTI-CNR).
 This add-on is a derivative port of their source code, which its authors distribute for testing, research
 and non-commercial use; the same terms apply to this port. Please refer to the project page for the
 original license and cite the papers above when using it in research. The bundled MatCap image is the

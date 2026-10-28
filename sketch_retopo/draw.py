@@ -15,7 +15,7 @@ from mathutils import Matrix, Vector
 
 from .core import phong
 from .core.config import ConfigRender
-from .core.curvenetwork import Patch, vih_iter, ch_iter
+from .core.curvenetwork import Patch, alive, vih_iter, ch_iter
 from .core.pn import normalized, acos_clamped
 
 _shaders = {}
@@ -228,18 +228,25 @@ class Drawer:
         self.triangles([p0, p0 + d - e, p0 + d + e, p1, p1 - d + e, p1 - d - e], color, depth=False)
 
     def num_subdiv_points(self, color):
+        """Core::render_edgechains_num_subdiv: the edges of curves without patches, shown as points."""
         pts = []
         for e in self.r.engine.curvenetwork.edgechains:
             c0, c1 = e.halfchain
-            if e.is_deleted or (c0 is not None and Patch.is_ordinary(c0.patch)) or (c1 is not None and Patch.is_ordinary(c1.patch)):
+            if e.is_deleted or (c0 is not None and alive(c0.patch)) or (c1 is not None and alive(c1.patch)):
                 continue
             if c0 is None or any(h.vertex.is_hidden for h in ch_iter(c0)):
                 continue
-            if e.num_subdiv > 1:
-                poly = c0.to_polyline()
-                for i in range(1, e.num_subdiv):
-                    pts.append(poly.point_at(i / float(e.num_subdiv))[:3])
+            for i in range(1, e.num_subdiv):
+                pts.append(c0.pn_at(i / float(e.num_subdiv))[:3])
         self.points(pts, color, 10)
+
+    def text(self, pos, string, color=(1, 1, 1)):
+        """Text centred at a 3D position (drawn in the pixel pass)."""
+        self.r.texts.append((np.asarray(pos, dtype=float)[:3].copy(), str(string), color))
+
+    def screen_text(self, string, color=(1, 1, 1)):
+        """Text centred at the top of the viewport (drawn in the pixel pass)."""
+        self.r.screen_texts.append((str(string), color))
 
 
 def _rgba(c):
@@ -257,6 +264,8 @@ class Renderer:
         self.base_cache = None
         self.view = None
         self.region = None
+        self.texts = []           # (local position, text, color) collected by Drawer.text
+        self.screen_texts = []
 
     # ---- caches ---------------------------------------------------------------------------
     def _patch_data(self, patch):
@@ -497,6 +506,8 @@ class Renderer:
         cr = eng.configRender
         cs = eng.configSaved
         self._prune()
+        self.texts = []
+        self.screen_texts = []
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.matrix.push()
@@ -540,15 +551,10 @@ class Renderer:
         if cs.symmetric:
             self._draw_negx()
         gpu.state.depth_mask_set(False)
-        lit = _lit_shader()
         for p in cn.patches:
             if p.is_hidden:
                 continue
-            nc = p.num_corners()
-            rgb = cr.patch_color_rgb[nc] if 0 <= nc < len(cr.patch_color_rgb) else (0, 0, 0)
-            if p.is_failure:
-                rgb = (0, 0, 0)
-            self.draw_patch_fill(p, (rgb[0], rgb[1], rgb[2], cr.patch_color_alpha))
+            self.draw_patch_fill(p, tuple(cr.color_patch) + (cr.color_patch_alpha,))
         if cs.symmetric:
             for p in cn.patches:
                 if p.is_hidden:
@@ -581,6 +587,8 @@ class Renderer:
                 d = self._patch_data(p)
                 self._points(d['irr3'], (0.2, 0.5, 1, 1), 7)
                 self._points(d['irr5'], (1, 0.5, 0.2, 1), 7)
+        # number of edges of curves without patches
+        Drawer(self).num_subdiv_points((0.1, 0.2, 1.0))
         self._axis_bbox()
 
     def _render_quadmesh_only(self):
@@ -590,26 +598,16 @@ class Renderer:
         cn = eng.curvenetwork
         offset = self.view.camera_distance() * 0.001
         gpu.state.depth_mask_set(True)
+        rgba = tuple(cr.color_patch) + (1.0,)
         for p in cn.patches:
             if p.is_hidden:
                 continue
-            nc = p.num_corners()
-            rgb = cr.patch_color_rgb[nc] if cr.quadmesh_only_show_auxiliary and 0 <= nc < 7 else cr.patch_color_rgb[4]
-            rgb = (0, 0, 0) if p.is_failure else tuple(min(1.0, c * 1.25) for c in rgb)
-            self.draw_patch_fill(p, rgb + (1.0,), shading=True, depth_offset=offset)
+            self.draw_patch_fill(p, rgba, shading=True, depth_offset=offset)
         if cs.symmetric:
             for p in cn.patches:
                 if p.is_hidden:
                     continue
-                nc = p.num_corners()
-                if not cr.quadmesh_only_show_left_side:
-                    rgb = (0.5, 0.5, 0.5)
-                elif cr.quadmesh_only_show_auxiliary and 0 <= nc < 7:
-                    rgb = cr.patch_color_rgb[nc]
-                else:
-                    rgb = cr.patch_color_rgb[4]
-                rgb = (0, 0, 0) if p.is_failure else tuple(min(1.0, c * 1.25) for c in rgb)
-                self.draw_patch_fill(p, rgb + (1.0,), shading=True, mirror=True, depth_offset=offset)
+                self.draw_patch_fill(p, rgba, shading=True, mirror=True, depth_offset=offset)
         polyline = _builtin('POLYLINE_UNIFORM_COLOR')
         for p in cn.patches:
             if p.is_failure or p.is_hidden:
@@ -683,7 +681,7 @@ class Renderer:
                 spheres.append((ct.brushSize_autocmpl(), brush))
             if state is eng.stateMoveVertex:
                 k = 1.0 if ct.brushSize_moveVertex.is_adjusting() else 0.8
-                spheres.append((ct.brushSize_moveVertex(), tuple(c * k for c in brush)))
+                spheres.append((ct.brushSize_moveVertex(), (k, k, 0, alpha * k)))
         unit = _sphere()
         gpu.state.depth_mask_set(False)
         for radius, color in spheres:
@@ -708,10 +706,38 @@ class Renderer:
             sh.uniform_float('color', (1, 0, 0, 1))
             batch.draw(sh)
         font_id = 0
+        region = context.region
+        if self.texts and self.view is not None:
+            blf.size(font_id, 18)
+            blf.enable(font_id, blf.SHADOW)
+            blf.shadow(font_id, 3, 0.0, 0.0, 0.0, 1.0)
+            blf.shadow_offset(font_id, 1, -1)
+            xy = self.view.project(np.array([t[0] for t in self.texts]))
+            for (pos, text, color), (x, y) in zip(self.texts, xy):
+                w, h = blf.dimensions(font_id, text)
+                blf.color(font_id, color[0], color[1], color[2], 1.0)
+                blf.position(font_id, float(x) - w / 2, float(y) - h / 2, 0)
+                blf.draw(font_id, text)
+            blf.disable(font_id, blf.SHADOW)
+        y = region.height - 30
+        for text, color in self.screen_texts:
+            blf.size(font_id, 18)
+            for line in text.split('\n'):
+                w, h = blf.dimensions(font_id, line)
+                blf.color(font_id, color[0], color[1], color[2], 1.0)
+                blf.position(font_id, (region.width - w) / 2, y, 0)
+                blf.draw(font_id, line)
+                y -= 24
+        # current mode name at the bottom right (as SketchRetopo2)
         state = eng.state
-        blf.size(font_id, 22)
-        r, g, b = state.state_color
-        blf.color(font_id, r, g, b, 1.0)
-        blf.position(font_id, 30, 30, 0)
+        blf.size(font_id, 18)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        w, h = blf.dimensions(font_id, state.state_name)
+        right = region.width
+        for other in context.area.regions:
+            # keep clear of the sidebar when it overlaps the viewport
+            if other.type == 'UI' and other.width > 1 and region.x < other.x < region.x + region.width:
+                right = min(right, other.x - region.x)
+        blf.position(font_id, right - 20 - w, 20, 0)
         blf.draw(font_id, state.state_name)
         gpu.state.blend_set('NONE')

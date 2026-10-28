@@ -20,23 +20,26 @@ from .core.engine import LEFT, RIGHT, MIDDLE, SKETCH
 from .draw import Renderer
 from .view import BlenderView, MayaCamera
 
+# (engine state index, name, description) in SketchRetopo2's key order; spine sketching and auto-completion
+# come from the earlier SketchRetopo release and sit on spare keys
 MODE_ITEMS = [
     ('0', 'Sketch', 'Basic sketching (Q)'),
-    ('1', 'Spine', 'Spine sketching (W)'),
-    ('2', 'Auto-complete', 'Auto-completion (E)'),
-    ('3', 'Laser', 'Laser cutting (R)'),
-    ('4', 'Cylinder', 'Cylinder sketching (T)'),
-    ('5', 'Deform Curve', 'Deform curves (Y)'),
-    ('6', 'Edit Corner', 'Corner editing (F)'),
+    ('5', 'Deform Curve', 'Deform curves (W)'),
+    ('3', 'Laser', 'Laser sketching (E)'),
+    ('4', 'Cylinder', 'Cylinder sketching (R)'),
+    ('6', 'Edit Corner', 'Corner editing (T)'),
     ('7', 'Edit Topology', 'Topology editing (A)'),
-    ('8', 'Edge Loop', 'Edge loop insertion (S)'),
+    ('10', 'Query Database', 'Query the patch database (S)'),
     ('9', 'Move Vertex', 'Move vertices (D)'),
+    ('8', 'Edge Loop', 'Edge loop insertion (F)'),
+    ('1', 'Spine', 'Spine sketching (Y, from the earlier SketchRetopo)'),
+    ('2', 'Auto-complete', 'Auto-completion (U, from the earlier SketchRetopo)'),
 ]
-MODE_KEYS = 'QWERTYFASD'
-_MODE_ORDER_KEYS = {0: 'Q', 1: 'W', 2: 'E', 3: 'R', 4: 'T', 5: 'Y', 6: 'F', 7: 'A', 8: 'S', 9: 'D'}
+_MODE_ORDER_KEYS = {0: 'Q', 5: 'W', 3: 'E', 4: 'R', 6: 'T', 7: 'A', 10: 'S', 9: 'D', 8: 'F', 1: 'Y', 2: 'U'}
+MODE_NAMES = {int(v): name for v, name, _ in MODE_ITEMS}
 
-STATUS_TEXT = ('SketchRetopo  |  Q sketch  W spine  E auto-complete  R laser  T cylinder  Y deform  F corner  '
-               'A topology  S edge loop  D move  |  Alt+drag camera  |  Ctrl+Z/Y undo/redo  |  Esc exit')
+STATUS_TEXT = ('SketchRetopo  |  Q sketch  W deform  E laser  R cylinder  T corner  A topology  S query DB  '
+               'D move  F edge loop  (Y spine  U auto-complete)  |  Alt+drag camera  |  Ctrl+Z/Y undo/redo  |  Esc exit')
 
 PASS_THROUGH_TYPES = {
     'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'WHEELINMOUSE', 'WHEELOUTMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM', 'MOUSEROTATE',
@@ -563,14 +566,14 @@ class SKETCHRETOPO_OT_clear(bpy.types.Operator):
         eng = _active_session(context).engine
         eng.memento_store()
         eng.curvenetwork.clear()
-        eng.trace_basemesh_boundary()
         eng.state.init()
         _tag_redraw_all()
         return {'FINISHED'}
 
 
 class SKETCHRETOPO_OT_toggle_symmetric(bpy.types.Operator):
-    """Toggle symmetry about the X=0 plane of the base mesh (discards all curves; cannot be undone)"""
+    """Symmetry about the X=0 plane of the base mesh: the other side is shown as a mirrored preview and added to
+    the exported mesh"""
     bl_idname = 'sketch_retopo.toggle_symmetric'
     bl_label = 'Symmetric'
 
@@ -578,17 +581,25 @@ class SKETCHRETOPO_OT_toggle_symmetric(bpy.types.Operator):
     def poll(cls, context):
         return _active_session(context) is not None
 
-    def invoke(self, context, event):
-        eng = _active_session(context).engine
-        if not eng.curvenetwork.empty() and any(not h.imaginary_patch for h in eng.curvenetwork.halfedges):
-            return context.window_manager.invoke_confirm(self, event, message='All current curves will be lost. Continue?') \
-                if bpy.app.version >= (4, 1, 0) else context.window_manager.invoke_confirm(self, event)
-        return self.execute(context)
-
     def execute(self, context):
         eng = _active_session(context).engine
-        eng.toggle_symmetric()
-        eng.state.init()
+        eng.set_symmetric(not eng.configSaved.symmetric)
+        _tag_redraw_all()
+        return {'FINISHED'}
+
+
+class SKETCHRETOPO_OT_snap_symmetry(bpy.types.Operator):
+    """Move curve and quad vertices lying closer to the X=0 plane than the curve sampling interval onto it, so
+    that the two halves join on export"""
+    bl_idname = 'sketch_retopo.snap_symmetry'
+    bl_label = 'Snap Symmetry'
+
+    @classmethod
+    def poll(cls, context):
+        return _active_session(context) is not None
+
+    def execute(self, context):
+        _active_session(context).engine.snap_symmetry()
         _tag_redraw_all()
         return {'FINISHED'}
 
@@ -657,8 +668,6 @@ class SKETCHRETOPO_OT_load_xml(bpy.types.Operator, ImportHelper):
             sess = session.get_or_create(obj)
             data['restore'](sess.engine)
             sess.engine.set_basemesh(sess.engine.basemesh, reset_curves=False)
-            if data['version'] != fileio.XML_VERSION:
-                self.report({'WARNING'}, 'The XML file format version is older than the current one (%d)' % fileio.XML_VERSION)
         except Exception as ex:
             self.report({'ERROR'}, 'Error occurred: %s' % ex)
             return {'CANCELLED'}
@@ -950,6 +959,7 @@ classes = (
     SKETCHRETOPO_OT_redo,
     SKETCHRETOPO_OT_clear,
     SKETCHRETOPO_OT_toggle_symmetric,
+    SKETCHRETOPO_OT_snap_symmetry,
     SKETCHRETOPO_OT_save_xml,
     SKETCHRETOPO_OT_load_xml,
     SKETCHRETOPO_OT_import_basemesh,

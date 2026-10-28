@@ -54,7 +54,7 @@ def main():
     print('quads', q0, '->', quad_count(eng), [pp.param.l for pp in eng.curvenetwork.patches])
 
     # edge loop insertion
-    eng.key_down('s')
+    eng.key_down('f')
     hover(eng, -0.21, -0.5)
     preview = eng.stateEdgeLoop.edgeLoop_preview.size()
     q1 = quad_count(eng)
