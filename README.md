@@ -110,6 +110,25 @@ and Blender's own shortcuts apply again.
 * **Render** – render mode, quads always visible, auxiliary data and mirrored side in quad-only mode,
   Phong tessellation of patches, opacity, corner/edge/singularity sizes, axis and bounding box.
 
+## Patch database (query mode and patches with more than 6 corners)
+
+SketchRetopo2 fills loops of 2–6 corners from built-in patterns. For the query database mode (`S`), and for
+loops with more corners (hold `X` and drag into the region), it looks layouts up in a database of patches
+learned from artist-made quad meshes: `patches.db`, from
+<https://github.com/kenshi84/files/releases/tag/sketch-retopo>. (The *huge* version comes in two parts:
+`cat patches.huge.db.0 patches.huge.db.1 > patches.db`.)
+
+* Set the file in the add-on preferences (*Patch Database*), or use **Load Patch Database** in the
+  sidebar's *Query Database* panel. Like the demo, a `patches.db` in your home folder is also picked up.
+  The database is loaded when SketchRetopo starts.
+* **Query Database** panel: the result shown (*Index*, also `Z`/`X`), *Freeze* (keep the shown result while
+  the lookup goes on), the lookup filters (maximum singularities and concave corners, singularity valence
+  range), *ILP Flow* and its tolerance (a polychord must start and end within that many edges of each flow
+  stroke's ends), the quality threshold, the Laplace weight used when placing results along the flows, the
+  sort order (by flow, by quality, by singularities), and **Stop**, **Restart** and **Delete Flow**.
+* The lookup runs in the background while you work; the best result so far is shown in the patch and the
+  status is displayed at the top of the viewport. Settings take effect at the next lookup (Restart).
+
 ## Files
 
 * **XML** – SketchRetopo2's format: base mesh, configuration, curve network, patches and material. Files
@@ -142,6 +161,13 @@ The behavior follows the C++ source; these parts necessarily differ:
   the original).
 * **Robustness.** A few situations that crash or hang the original (for example a boundary whose edge counts
   admit no pattern, or a laser plane passing exactly through mesh vertices) are handled gracefully.
+* **Patch database lookup.** The original runs the lookup on worker threads with the SCIP solver; this port
+  runs it incrementally in Blender's event loop with its own exact enumeration of the integer solutions. It was
+  checked against the original C++ lookup compiled from the demo's source: the same patches are found, in the
+  same order, and placed identically. Two corner cases can differ: when two polychord widths give the very same
+  mesh, the original keeps whichever SCIP happens to list first (the mesh is identical), and on perfectly
+  regular grids with flow strokes the original's placement depends on rounding noise. Python is slower than
+  the original's C++, so large boundaries take longer to complete (results appear as they are found).
 * **Sizes on screen.** The snapping radius, brushes and corner markers scale with the view as in the
   original (whose camera has a 40° field of view), so they look the same size on screen.
 
@@ -150,7 +176,8 @@ The behavior follows the C++ source; these parts necessarily differ:
 The core is independent of Blender's UI and only needs `numpy` and `mathutils`:
 
 ```
-sketch_retopo/core/   port of SketchRetopo (engine, curve network, states, base mesh, patchgen, ILP)
+sketch_retopo/core/   port of SketchRetopo (engine, curve network, states, base mesh, patchgen, ILP,
+                      learnquad = the patch database lookup)
 sketch_retopo/*.py    Blender integration (modal operator, drawing, panels, sessions)
 tests/                tests (run with the `bpy` module from PyPI or inside Blender)
 ```
@@ -160,6 +187,7 @@ pip install bpy            # matching your Python version
 python tests/test_patchgen.py
 python tests/test_core_sketch.py
 python tests/test_core_tools.py
+python tests/test_learnquad.py
 python tests/test_blender_addon.py
 ```
 

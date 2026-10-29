@@ -15,6 +15,7 @@ from mathutils import Vector
 
 from . import session
 from .core import fileio
+from .props import apply_query_settings, default_patch_db_path, addon_prefs
 from .core.config import ConfigRender
 from .core.engine import LEFT, RIGHT, MIDDLE, SKETCH
 from .draw import Renderer
@@ -179,6 +180,8 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
         self._last_autocmpl = 0.0
         self._hidden_base = None
         self._hidden_outputs = {}
+        apply_query_settings(sess.engine, context.scene.sketch_retopo)
+        _autoload_patch_db(sess.engine, self.report)
         self._h3d = bpy.types.SpaceView3D.draw_handler_add(_draw_view_cb, (self,), 'WINDOW', 'POST_VIEW')
         self._h2d = bpy.types.SpaceView3D.draw_handler_add(_draw_px_cb, (self,), 'WINDOW', 'POST_PIXEL')
         wm = context.window_manager
@@ -349,6 +352,9 @@ class SKETCHRETOPO_OT_sketch(bpy.types.Operator):
             self._update_view(context)
             if eng.stateAutocmpl.update_preview():
                 redraw = True
+        if eng.state is eng.stateQueryDB and eng.stateQueryDB.update(0.02):
+            redraw = True
+            _tag_redraw_all()
         at = eng.configTemp.autoSave
         if at.enabled and at.filename and at.unsaved and time.time() - at.last_time > at.interval:
             at.last_time = time.time()
@@ -501,6 +507,110 @@ def _active_session(context):
     if sess is None:
         sess = session.get(context.scene.sketch_retopo.base_object)
     return sess
+
+
+def _autoload_patch_db(eng, report=None):
+    """Loads the patch database of the preferences (or ~/patches.db) into an engine that has none."""
+    lq = eng.learnquad
+    if lq.is_loaded():
+        return
+    path = default_patch_db_path()
+    if not path:
+        return
+    try:
+        n = lq.load(path)
+    except Exception as ex:
+        if report:
+            report({'WARNING'}, 'Could not load the patch database %s: %s' % (path, ex))
+        return
+    if report:
+        report({'INFO'}, 'Patch database: %d templates (%s)' % (n, path))
+
+
+class SKETCHRETOPO_OT_load_patch_db(bpy.types.Operator, ImportHelper):
+    """Load the patch database (patches.db from the SketchRetopo2 demo) used by the query database mode and for
+    patches with more than 6 corners"""
+    bl_idname = 'sketch_retopo.load_patch_db'
+    bl_label = 'Load Patch Database'
+    filename_ext = '.db'
+    filter_glob: StringProperty(default='*.db', options={'HIDDEN'})
+
+    def execute(self, context):
+        path = self.filepath
+        from .core import learnquad
+        try:
+            db = learnquad.open_db(path)
+        except Exception as ex:
+            self.report({'ERROR'}, 'Not a patch database: %s' % ex)
+            return {'CANCELLED'}
+        for s in session.all_sessions():
+            s.engine.learnquad.load(path)
+        prefs = addon_prefs(context)
+        if prefs is not None:
+            prefs.patch_db_path = path
+            context.preferences.is_dirty = True
+        self.report({'INFO'}, 'Patch database: %d templates' % db.num_templates)
+        _tag_redraw_all()
+        return {'FINISHED'}
+
+
+def _query_state(context):
+    sess = _active_session(context)
+    if sess is None or sess.engine.state is not sess.engine.stateQueryDB:
+        return None
+    return sess.engine.stateQueryDB
+
+
+class SKETCHRETOPO_OT_query_stop(bpy.types.Operator):
+    """Stop the database lookup, keeping the results found so far"""
+    bl_idname = 'sketch_retopo.query_stop'
+    bl_label = 'Stop'
+
+    @classmethod
+    def poll(cls, context):
+        return _query_state(context) is not None
+
+    def execute(self, context):
+        _query_state(context).stop_lookup()
+        _tag_redraw_all()
+        return {'FINISHED'}
+
+
+class SKETCHRETOPO_OT_query_restart(bpy.types.Operator):
+    """Run the database lookup again for the selected patch and flows (e.g. after changing its settings)"""
+    bl_idname = 'sketch_retopo.query_restart'
+    bl_label = 'Restart'
+
+    @classmethod
+    def poll(cls, context):
+        st = _query_state(context)
+        return st is not None and st.selected_patch is not None
+
+    def execute(self, context):
+        sess = _active_session(context)
+        apply_query_settings(sess.engine, context.scene.sketch_retopo)
+        if not sess.engine.learnquad.is_loaded():
+            self.report({'WARNING'}, 'No patch database loaded')
+            return {'CANCELLED'}
+        _query_state(context).restart()
+        _tag_redraw_all()
+        return {'FINISHED'}
+
+
+class SKETCHRETOPO_OT_query_delete_flow(bpy.types.Operator):
+    """Delete the last flow stroke (Restart to look up again)"""
+    bl_idname = 'sketch_retopo.query_delete_flow'
+    bl_label = 'Delete Flow'
+
+    @classmethod
+    def poll(cls, context):
+        st = _query_state(context)
+        return st is not None and bool(st.querydata.strokes)
+
+    def execute(self, context):
+        _query_state(context).delete_flow()
+        _tag_redraw_all()
+        return {'FINISHED'}
 
 
 class SKETCHRETOPO_OT_set_mode(bpy.types.Operator):
@@ -970,6 +1080,10 @@ classes = (
     SKETCHRETOPO_OT_reset_center,
     SKETCHRETOPO_OT_camera_params,
     SKETCHRETOPO_OT_stats,
+    SKETCHRETOPO_OT_load_patch_db,
+    SKETCHRETOPO_OT_query_stop,
+    SKETCHRETOPO_OT_query_restart,
+    SKETCHRETOPO_OT_query_delete_flow,
 )
 
 

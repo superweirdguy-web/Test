@@ -1,6 +1,8 @@
 # Sidebar panels (View3D > Sidebar > SketchRetopo), mirroring the original program's
 # AntTweakBar: file, mode, config, snakes, camera and render groups, plus a controls reference.
 
+import os
+
 import bpy
 
 from . import session
@@ -34,8 +36,10 @@ CONTROLS = {
         'Click inside a patch: select it; 4-sided: drag to move the poles',
         'Other patches: click an arrow, Z X C V adjust it, B / Shift+B: pattern'],
     10: ['Click a patch to select it',
-         'Drag inside it: flow strokes (Shift+drag adds more)',
-         'Z / X: previous / next result from the database'],
+         'Drag inside it: a flow stroke starts the lookup',
+         'Shift+drag: add another flow stroke',
+         'Z / X: previous / next result from the database',
+         'Needs patches.db (Query Database panel)'],
     9: ['Drag: move vertices (falloff brush), Shift+drag: smooth',
         'Ctrl+click a patch: relax it over the surface',
         'G: one step of global smoothing',
@@ -141,6 +145,51 @@ class SKETCHRETOPO_PT_file(bpy.types.Panel):
         col = layout.column(align=True)
         col.operator('sketch_retopo.load_material', icon='MATERIAL')
         col.operator('sketch_retopo.default_material', icon='SHADING_SOLID')
+
+
+class SKETCHRETOPO_PT_query_db(bpy.types.Panel):
+    bl_label = 'Query Database'
+    bl_parent_id = 'SKETCHRETOPO_PT_main'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'SketchRetopo'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.sketch_retopo
+        sess = _session(context)
+        lq = sess.engine.learnquad if sess is not None else None
+        col = layout.column(align=True)
+        if lq is not None and lq.is_loaded():
+            col.label(text='%d templates' % lq.num_templates(), icon='CHECKMARK')
+            col.label(text=os.path.basename(lq.path))
+        else:
+            col.label(text='No database loaded', icon='ERROR')
+        col.operator('sketch_retopo.load_patch_db', icon='FILE_FOLDER')
+        querying = sess is not None and sess.engine.state is sess.engine.stateQueryDB
+        col = layout.column(align=True)
+        col.enabled = querying
+        row = col.row(align=True)
+        row.prop(st, 'qdb_index')
+        row.prop(st, 'qdb_freeze', toggle=True)
+        if querying and sess.engine.stateQueryDB.status_msg:
+            for line in sess.engine.stateQueryDB.status_msg.split('\n'):
+                col.label(text=line)
+        col = layout.column(align=True)
+        for p in ('qdb_max_numsing', 'qdb_max_concave', 'qdb_min_valence', 'qdb_max_valence'):
+            col.prop(st, p)
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(st, 'qdb_ilp_flow', toggle=True)
+        row.prop(st, 'qdb_ilp_flow_tlrnc', text='Tolerance')
+        col.prop(st, 'qdb_quality_th')
+        col.prop(st, 'qdb_laplace_w')
+        layout.row(align=True).prop(st, 'qdb_sort', expand=True)
+        row = layout.row(align=True)
+        row.operator('sketch_retopo.query_stop', icon='PAUSE')
+        row.operator('sketch_retopo.query_restart', icon='FILE_REFRESH')
+        row.operator('sketch_retopo.query_delete_flow', icon='X')
 
 
 class SKETCHRETOPO_PT_config(bpy.types.Panel):
@@ -249,6 +298,7 @@ class SKETCHRETOPO_PT_help(bpy.types.Panel):
 classes = (
     SKETCHRETOPO_PT_main,
     SKETCHRETOPO_PT_file,
+    SKETCHRETOPO_PT_query_db,
     SKETCHRETOPO_PT_config,
     SKETCHRETOPO_PT_snakes,
     SKETCHRETOPO_PT_camera,

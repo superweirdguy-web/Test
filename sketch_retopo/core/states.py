@@ -1341,9 +1341,8 @@ class StateQueryDB(State):
         self.init()
 
     def init(self):
-        lq = self.core.learnquad
-        if lq is not None:
-            lq.stop()
+        """StateQueryDB::enter_state."""
+        self.core.learnquad.stop()
         self.querydata = QueryData()
         self.lookup_index = -1
         self.selected_patch = None
@@ -1352,33 +1351,34 @@ class StateQueryDB(State):
         self.basemesh_uv = None
         self.status = 'idle'
         self.status_msg = ''
-        self._num_results_shown = -1
+        self._last_notify = 0.0
 
     def exit(self):
-        lq = self.core.learnquad
-        if lq is not None:
-            lq.stop()
+        self.core.learnquad.stop()
 
-    # ---- lookup progress (called by the host while this mode is active) ----
+    # ---- lookup progress (driven by the host's timer while this mode is active) ----
     def update(self, time_budget=0.03):
+        """Advances the lookup and, like the original's progress notifications (at most every 0.2 s), refreshes the
+        status and shows the current best result.  Returns True when something changed."""
         lq = self.core.learnquad
-        if lq is None or self.status in ('idle', 'complete'):
+        if self.status in ('idle', 'complete'):
             return False
         lq.step(time_budget)
-        status = lq.status
-        changed = status != self.status or lq.num_results() != self._num_results_shown
-        self.status = status
-        if changed:
-            self._num_results_shown = lq.num_results()
-            self.update_status_msg()
-            if not self.freeze and self.lookup_index >= 0:
-                self.update_patch()
-        return changed
+        complete = lq.status == 'complete'
+        now = time.perf_counter()
+        if not complete and now - self._last_notify < 0.2:
+            return False
+        self._last_notify = now
+        self.status = 'complete' if complete else 'progress'
+        self.update_status_msg()
+        if not self.freeze:
+            self.update_patch()
+        return True
 
     def update_patch(self):
         lq = self.core.learnquad
         p = self.selected_patch
-        if lq is None or p is None or p.is_deleted:
+        if p is None or p.is_deleted:
             return
         if not lq.convert_result(self.lookup_index, p):
             return
@@ -1396,14 +1396,52 @@ class StateQueryDB(State):
         else:
             msg = {'started': 'started...', 'progress': 'in progress...', 'complete': 'complete!'}.get(self.status,
                                                                                                  'canceled.')
-            n = lq.num_results() if lq is not None else 0
+            n = lq.num_results()
             self.status_msg = 'lookup %s\n' % msg + (
                 '(no patches found yet)' if n == 0 else 'patch index: %d / %d' % (self.lookup_index, n - 1))
+
+    # ---- sidebar buttons ----
+    def stop_lookup(self):
+        """'stop': interrupts the lookup, keeping what was found."""
+        lq = self.core.learnquad
+        running = lq.lookup.running
+        lq.stop()
+        if running and self.status != 'idle':
+            self.status = 'complete'
+            if not self.freeze:
+                self.update_patch()
+        self.update_status_msg()
+
+    def restart(self):
+        """'restart': runs the lookup again (e.g. after changing its settings) with the current flows."""
+        lq = self.core.learnquad
+        if self.selected_patch is None or not self.querydata.num_subdiv:
+            return
+        self.status = 'started'
+        self.update_status_msg()
+        lq.restart(self.querydata)
+        self._last_notify = time.perf_counter()
+        self.lookup_index = 0
+
+    def delete_flow(self):
+        """'delete_flow': removes the last flow stroke (the lookup is not restarted)."""
+        if not self.querydata.strokes:
+            return
+        lq = self.core.learnquad
+        lq.stop()
+        self.querydata.strokes.pop()
+        self.status = 'idle'
+        lq.send_strokes(self.querydata)
+
+    def set_index(self, value):
+        if 0 <= value < self.core.learnquad.num_results():
+            self.lookup_index = value
+            self.update_patch()
 
     def display(self, drawer):
         core = self.core
         cr = core.configRender
-        if core.learnquad is None:
+        if not core.learnquad.is_loaded():
             drawer.screen_text('No patch database loaded (SketchRetopo sidebar > Query Database)')
         p = self.selected_patch
         if p is not None and not p.is_deleted:
@@ -1450,8 +1488,7 @@ class StateQueryDB(State):
         lq = core.learnquad
         if best is not self.selected_patch:
             # selected a new patch: parameterize the base mesh under it and set the query data
-            if lq is not None:
-                lq.stop()
+            lq.stop()
             self.selected_patch = best
             self.querydata = QueryData()
             self.lookup_index = -1
@@ -1487,6 +1524,7 @@ class StateQueryDB(State):
                 p_h = best.prev_halfedge_handle(p_h)
             qd.boundary_xyz = np.array(bxyz)
             qd.boundary_uv = np.array(buv)
+            lq.send_query(qd)
             return
         if not shift:
             self.querydata.strokes = []
@@ -1514,7 +1552,7 @@ class StateQueryDB(State):
         stroke.resample_by_length(ct.segmentSize())
         if stroke.length() < ct.segmentSize():
             self.current_stroke = Polyline()
-            if not self.querydata.strokes and lq is not None:
+            if not self.querydata.strokes:
                 lq.stop()
             return
         bm = core.basemesh
@@ -1532,21 +1570,20 @@ class StateQueryDB(State):
         if len(pts) < 2:
             return
         self.querydata.strokes.append((np.array(pts), np.array(uvs), stroke.is_loop))
-        if lq is None:
-            core.report('No patch database loaded', 'WARNING')
+        if not lq.is_loaded():
+            core.report('No patch database loaded (SketchRetopo sidebar > Query Database)', 'WARNING')
             return
         # perform the lookup
         core.memento_store()
-        lq.stop()
-        lq.start_lookup(self.querydata)
         self.status = 'started'
-        self._num_results_shown = -1
-        self.lookup_index = 0
         self.update_status_msg()
+        lq.start_lookup(self.querydata)
+        self._last_notify = time.perf_counter()
+        self.lookup_index = 0
 
     def keyboard(self, key):
         lq = self.core.learnquad
-        if key not in ('z', 'x') or lq is None:
+        if key not in ('z', 'x'):
             return
         n = lq.num_results()
         self.lookup_index = min(max(self.lookup_index + (-1 if key == 'z' else 1), 0), n - 1)

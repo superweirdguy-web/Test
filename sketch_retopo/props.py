@@ -2,6 +2,8 @@
 # session (getter/setter pairs), so the sidebar always shows the live values,
 # including the ones adjusted by right-dragging in the viewport.
 
+import os
+
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty)
 
@@ -217,6 +219,94 @@ def _mesh_poll(self, obj):
     return obj.type == 'MESH'
 
 
+# ---- query database (SketchRetopo2's query_db group) --------------------------------------------------------
+
+SORT_ITEMS = [('FLOW', 'By Flow', 'Sort by distance to the flow strokes, then singularities, then quad quality'),
+              ('QUALITY', 'By Quality', 'Sort by quad quality, then singularities, then flow distance'),
+              ('NUMSING', 'By Singularities', 'Sort by number and type of singularities, then flow distance')]
+
+
+def apply_query_settings(eng, st=None):
+    """Copies the scene's query database settings to an engine (used by its next lookup)."""
+    from .core import learnquad
+    if st is None:
+        st = bpy.context.scene.sketch_retopo
+    lk = eng.learnquad.lookup
+    lk.max_singularities = st.qdb_max_numsing
+    lk.max_concavities = st.qdb_max_concave
+    lk.min_valence = st.qdb_min_valence
+    lk.max_valence = st.qdb_max_valence
+    lk.min_size_threshold_ilp = 1 if st.qdb_ilp_flow else 1 << 62
+    lk.flow_tolerance = st.qdb_ilp_flow_tlrnc
+    lk.sort_criteria = {'FLOW': learnquad.SORT_BY_FLOW, 'QUALITY': learnquad.SORT_BY_QUALITY,
+                        'NUMSING': learnquad.SORT_BY_NUMSING}[st.qdb_sort]
+    rt = eng.learnquad.retopologizer
+    rt.quality_threshold = st.qdb_quality_th
+    rt.lap_weight = st.qdb_laplace_w
+
+
+def _qdb_update(self, context):
+    for s in session.all_sessions():
+        apply_query_settings(s.engine, self)
+
+
+def _qdb_state():
+    eng = _engine()
+    return eng.stateQueryDB if eng is not None else None
+
+
+def _qdb_index_get(self):
+    eng = _engine()
+    return eng.stateQueryDB.lookup_index if eng is not None and eng.state is eng.stateQueryDB else -1
+
+
+def _qdb_index_set(self, value):
+    eng = _engine()
+    if eng is not None and eng.state is eng.stateQueryDB:
+        eng.stateQueryDB.set_index(value)
+        _redraw()
+
+
+def _qdb_freeze_get(self):
+    st = _qdb_state()
+    return bool(st and st.freeze)
+
+
+def _qdb_freeze_set(self, value):
+    st = _qdb_state()
+    if st is not None:
+        st.freeze = value
+
+
+def addon_prefs(context=None):
+    context = context or bpy.context
+    addon = context.preferences.addons.get(__package__)
+    return addon.preferences if addon is not None else None
+
+
+def default_patch_db_path(context=None):
+    """The database file to load: the one set in the add-on preferences, else patches.db in the home folder
+    (where the SketchRetopo2 demo looks for it)."""
+    prefs = addon_prefs(context)
+    path = bpy.path.abspath(prefs.patch_db_path) if prefs is not None and prefs.patch_db_path else ''
+    if path and os.path.isfile(path):
+        return path
+    home = os.path.join(os.path.expanduser('~'), 'patches.db')
+    return home if os.path.isfile(home) else ''
+
+
+class SketchRetopoPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    patch_db_path: StringProperty(name='Patch Database', subtype='FILE_PATH',
+                                  description='patches.db of the SketchRetopo2 demo (data-driven patches: the query '
+                                              'database mode and patches with more than 6 corners).  Loaded when '
+                                              'SketchRetopo starts; patches.db in the home folder is used otherwise')
+
+    def draw(self, context):
+        self.layout.prop(self, 'patch_db_path')
+
+
 _g = {}
 for _n in ('snapSize', 'brushSize_spine', 'brushSize_autocmpl', 'brushSize_moveVertex', 'quadSize', 'segmentSize'):
     _g[_n] = _real_param(_n)
@@ -345,8 +435,32 @@ class SketchRetopoSettings(bpy.types.PropertyGroup):
 
     show_help: BoolProperty(name='Show Controls', default=True)
 
+    # query database (applied to the next lookup)
+    qdb_index: IntProperty(name='Index', min=-1, get=_qdb_index_get, set=_qdb_index_set,
+                           description='Result shown in the selected patch (Z / X in the viewport)')
+    qdb_freeze: BoolProperty(name='Freeze', get=_qdb_freeze_get, set=_qdb_freeze_set,
+                             description='Keep showing the current result while the lookup goes on')
+    qdb_max_numsing: IntProperty(name='Max Singularities', default=16, min=0, update=_qdb_update,
+                                 description='Skip templates with more irregular vertices')
+    qdb_max_concave: IntProperty(name='Max Concave Corners', default=0, min=0, update=_qdb_update,
+                                 description='Skip templates with more concave corners')
+    qdb_min_valence: IntProperty(name='Min Valence', default=3, min=2, max=3, update=_qdb_update,
+                                 description='Skip templates with irregular vertices of lower valence')
+    qdb_max_valence: IntProperty(name='Max Valence', default=5, min=5, update=_qdb_update,
+                                 description='Skip templates with irregular vertices of higher valence')
+    qdb_ilp_flow: BoolProperty(name='ILP Flow', default=True, update=_qdb_update,
+                               description='Require a polychord to start and end near each flow stroke\'s ends')
+    qdb_ilp_flow_tlrnc: IntProperty(name='ILP Flow Tolerance', default=1, min=0, update=_qdb_update,
+                                    description='How many edges a polychord end may be away from a flow end')
+    qdb_quality_th: FloatProperty(name='Quality Threshold', default=1.0, min=0.0, max=1.0, step=1, update=_qdb_update,
+                                  description='Skip results whose worst corner angle deviates more from 90 degrees '
+                                              '(1 keeps all)')
+    qdb_sort: EnumProperty(name='Sort', items=SORT_ITEMS, default='FLOW', update=_qdb_update)
+    qdb_laplace_w: FloatProperty(name='Laplace Weight', default=0.8, min=0.01, max=0.99, step=1, update=_qdb_update,
+                                 description='Smoothness against flow following when placing results')
 
-classes = (SketchRetopoSettings,)
+
+classes = (SketchRetopoPreferences, SketchRetopoSettings)
 
 
 def register():

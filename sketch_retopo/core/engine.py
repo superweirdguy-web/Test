@@ -27,6 +27,7 @@ from .curvenetwork import (Core, Patch, alive, voh_iter, vih_iter, voc_iter, pc_
 from .polymesh import find_edgeloop, insert_edgeloop
 from .config import ConfigTemp, ConfigSaved, ConfigRender
 from . import patchgen
+from . import learnquad
 
 
 class Memento:
@@ -131,8 +132,8 @@ class Engine:
         self.common_alt_pressed = False
         self.hide_stroke = Polyline2d()
 
-        # data-driven quadrangulation (learnquad.LearnQuad), set by the host when a patch database is loaded
-        self.learnquad = None
+        # data-driven quadrangulation (patch database), loaded by the host
+        self.learnquad = learnquad.LearnQuad()
         self.material_texture_png_base64 = ''
         self.messages = []                    # (level, text) for the host to report
         self.requests = []                    # host actions requested by keys (save, load, export, ...)
@@ -305,7 +306,7 @@ class Engine:
         if 2 <= num_corners <= 6:
             ok = patch.generate_topology_default(num_subdiv) is not None
         else:
-            ok = self.learnquad is not None and self.learnquad.generate_patch(self, patch, num_subdiv)
+            ok = self.learnquad.generate_patch(self, patch, num_subdiv)
         if not ok:
             delete_patch(patch)
             return None
