@@ -180,7 +180,8 @@ The behavior follows the C++ source; these parts necessarily differ:
   template decodes identically, and the same patches are found, in the same order (as the original run on one
   thread: with several threads it keeps an arbitrary one of two rotations of a symmetric template that give the
   same mesh), and placed identically (to about 1e-12). The exception is the placement along flow strokes of
-  layouts with exactly or nearly parallelogram-shaped quads in the parameter domain, about 1% of the results:
+  layouts with exactly or nearly parallelogram-shaped quads in the parameter domain (1–6% of the results in the
+  tests):
   there the original's bilinear-coordinate formula is numerically unstable and its output depends on rounding
   noise, so it cannot be reproduced. Being free of SCIP's overhead, the lookup needs about a third of the
   original's CPU time; it runs on one core, so the original on four or more cores finishes big lookups sooner.
