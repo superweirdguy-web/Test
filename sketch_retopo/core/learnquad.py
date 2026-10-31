@@ -9,6 +9,8 @@ Meshes are kept as plain lists (face -> 4 vertices, face -> 4 adjacent faces and
 `Pos`, which follows vcg::face::Pos exactly, so that the walks of the original code can be ported literally."""
 
 import bisect
+import collections
+import copy
 import math
 import os
 import sqlite3
@@ -539,7 +541,7 @@ def boundary_ids_str(sides):
 class Template:
     """One database row.  The mesh is decoded on demand."""
     __slots__ = ('index', 'topology', 'boundary_ids', 'ends', 'side_len', 'n_vars', 'n_sing', 'sing_vec', 'n_corners',
-                 'n_faces', 'n_vertices', 'n_occ', 'n_concave', 'perimeter', 'mesh', 'start', 'border_edges')
+                 'n_faces', 'n_vertices', 'n_occ', 'n_concave', 'perimeter', 'mesh', 'start', 'border_edges', '_key_ids')
 
     def __init__(self, index, row):
         topology, boundary_ids, singularities, n_sing, n_corners, n_faces, n_vertices, n_occ, n_concave = row
@@ -569,11 +571,20 @@ class Template:
         self.mesh = None
         self.start = None
         self.border_edges = None
+        self._key_ids = None
+
+    def key_ids(self):
+        if self._key_ids is None:
+            self._key_ids = tuple(tuple(s) for s in self.boundary_ids)
+        return self._key_ids
 
     def ensure_mesh(self):
         if self.mesh is not None:
             return
-        m = build_template_mesh(decode_topology(self.topology), self.n_vertices)
+        try:
+            m = build_template_mesh(decode_topology(self.topology), self.n_vertices)
+        except (ValueError, IndexError, TypeError) as ex:
+            raise MalformedTemplate(str(ex))
         if m.nf != self.n_faces:
             raise MalformedTemplate('face count mismatch')
         # walk on the border as Patch::reconstructPatch does, recording the boundary id of each border edge
@@ -1439,9 +1450,56 @@ def flows_polychords_distance(n_sides, key, flows, polychord_vec, P):
 
 
 # ---- geometry (PatchFlattener / PatchRetopologizer) ----------------------------------------------------------------
-def _solve_spd(rows, cols, vals, n, rhs):
-    from .engine import _solve_sparse_spd
-    return _solve_sparse_spd(rows, cols, vals, n, rhs)
+DENSE_SOLVE_MAX = 128    # larger systems use conjugate gradients (faster there, and threaded BLAS stalls on a busy machine)
+
+
+def _solve_spd(rows, cols, vals, n, rhs, tol=1e-14):
+    """Solves a symmetric positive definite system given as triplets (duplicates summed): dense for small systems,
+    Jacobi-preconditioned conjugate gradients (one column per coordinate) otherwise."""
+    rhs = np.asarray(rhs, dtype=float)
+    out = np.zeros_like(rhs)
+    if n == 0:
+        return out
+    key = rows * n + cols
+    if n <= DENSE_SOLVE_MAX:
+        A = np.bincount(key, weights=vals, minlength=n * n).reshape(n, n)
+        try:
+            return np.linalg.solve(A, rhs)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(A, rhs, rcond=None)[0]
+    uk, inv = np.unique(key, return_inverse=True)
+    v = np.bincount(inv.reshape(-1), weights=vals)
+    r_ = uk // n
+    c_ = uk % n
+    on = r_ == c_
+    diag = np.bincount(r_[on], weights=v[on], minlength=n)
+    diag[np.abs(diag) < 1e-300] = 1.0
+    for j in range(rhs.shape[1]):
+        b = rhs[:, j]
+        bnorm = float(np.sqrt(b @ b))
+        if bnorm == 0:
+            continue
+        x = b / diag
+        r = b - np.bincount(r_, weights=v * x[c_], minlength=n)
+        z = r / diag
+        p = z.copy()
+        rz = float(r @ z)
+        for _ in range(20 * n):
+            Ap = np.bincount(r_, weights=v * p[c_], minlength=n)
+            pAp = float(p @ Ap)
+            if pAp <= 0:
+                break
+            alpha = rz / pAp
+            x += alpha * p
+            r -= alpha * Ap
+            if float(np.sqrt(r @ r)) <= tol * bnorm:
+                break
+            z = r / diag
+            rz_new = float(r @ z)
+            p = z + (rz_new / rz) * p
+            rz = rz_new
+        out[:, j] = x
+    return out
 
 
 def _laplacian_triplets(m, weight):
@@ -1466,14 +1524,13 @@ def implicit_smooth(m, border, lap_weight, constraints=(), target=None):
     if constraints:
         pen = 1.0 - lap_weight
         c = pen * pen / 3.0
-        for f, w, t in constraints:
-            fv = m.fv[f]
-            for j in range(4):
-                for k in range(4):
-                    rows.append(np.array([fv[j]]))
-                    cols.append(np.array([fv[k]]))
-                    vals.append(np.array([c * w[j] * w[k]]))
-                rhs[fv[j]] += c * w[j] * np.asarray(t)
+        FV = np.array([m.fv[f] for f, _, _ in constraints], dtype=np.int64)          # (k, 4)
+        W = np.array([w for _, w, _ in constraints], dtype=float)                    # (k, 4)
+        Tg = np.array([t for _, _, t in constraints], dtype=float).reshape(-1, 3)    # (k, 3)
+        rows.append(np.repeat(FV, 4, axis=1).reshape(-1))
+        cols.append(np.tile(FV, (1, 4)).reshape(-1))
+        vals.append((c * W[:, :, None] * W[:, None, :]).reshape(-1))
+        np.add.at(rhs, FV.reshape(-1), (c * W[:, :, None] * Tg[:, None, :]).reshape(-1, 3))
     x = _solve_spd(np.concatenate(rows), np.concatenate(cols), np.concatenate(vals), n, rhs)
     m.P = np.asarray(x, dtype=float).reshape(n, 3)
 
@@ -1602,17 +1659,22 @@ class UVLocator:
                     row = cells[x]
                     for y in range(cmin[t, 1], cmax[t, 1] + 1):
                         row[y].append(t)
-        self.cells = [[np.array(c, dtype=np.int64) for c in row] for row in cells]
+        # cells as one list (CSR): the triangles of cell (x, y) in index order
+        counts = np.array([len(c) for row in cells for c in row], dtype=np.int64)
+        self.cell_ptr = np.concatenate(([0], np.cumsum(counts)))
+        self.cell_tris = np.array([t for row in cells for c in row for t in c], dtype=np.int64)
         e1 = T[:, 1] - T[:, 0]
         e2 = T[:, 2] - T[:, 0]
         self.area = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
 
     def _bary(self, idx, p):
+        """vcg::Triangle2::InterpolationParameters of point(s) p in triangles idx (NaN -> 1/3 each)."""
         T = self.T[idx]
         x1, y1 = T[:, 0, 0], T[:, 0, 1]
         x2, y2 = T[:, 1, 0], T[:, 1, 1]
         x3, y3 = T[:, 2, 0], T[:, 2, 1]
-        x, y = p
+        p = np.asarray(p, dtype=float)
+        x, y = (p[..., 0], p[..., 1])
         with np.errstate(divide='ignore', invalid='ignore'):
             l1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / ((y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3))
             l2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / ((y3 - y1) * (x2 - x3) + (x1 - x3) * (y2 - y3))
@@ -1623,22 +1685,8 @@ class UVLocator:
         l3 = np.where(bad, 1 / 3, l3)
         return np.stack((l1, l2, l3), axis=1)
 
-    def locate(self, p):
-        """(triangle, barycentric coordinates) of uv point p; the closest triangle when p is outside."""
-        p = np.asarray(p, dtype=float)[:2]
-        if len(self.tris) == 0:
-            return None
-        if np.all(p >= self.lo) and np.all(p <= self.hi):
-            c = np.floor((p - self.lo) / self.edge).astype(np.int64)
-            cand = self.cells[min(max(c[0], 0), self.size - 1)][min(max(c[1], 0), self.size - 1)]
-            if len(cand):
-                bc = self._bary(cand, p)
-                eps = 0.0001
-                inside = np.all((bc >= -eps) & (bc <= 1 + eps), axis=1) & (self.area[cand] > 0.00001)
-                k = np.flatnonzero(inside)
-                if len(k):
-                    return int(cand[k[0]]), bc[k[0]]
-        # closest triangle (by distance to its edges, as UVGrid::getClosest)
+    def _closest(self, p):
+        """UVGrid::getClosest: the triangle whose edges come closest to p, and the coordinates of that point."""
         T = self.T
         best_d = None
         best_c = None
@@ -1661,21 +1709,57 @@ class UVLocator:
         k = int(np.argmin(best_d))
         return k, self._bary(np.array([k]), best_c[k])[0]
 
+    def locate_all(self, uv):
+        """(triangle, barycentric coordinates) of each uv point: the first triangle of its grid cell containing it
+        (UVGrid::CoordinatesPointUnique), else the closest triangle."""
+        uv = np.asarray(uv, dtype=float).reshape(-1, 2)
+        n = len(uv)
+        tri = -np.ones(n, dtype=np.int64)
+        bc = np.zeros((n, 3))
+        if len(self.tris) == 0 or n == 0:
+            return tri, bc
+        idx = np.flatnonzero(np.all((uv >= self.lo) & (uv <= self.hi), axis=1))
+        if len(idx):
+            c = np.clip(np.floor((uv[idx] - self.lo) / self.edge).astype(np.int64), 0, self.size - 1)
+            cid = c[:, 0] * self.size + c[:, 1]
+            starts = self.cell_ptr[cid]
+            counts = self.cell_ptr[cid + 1] - starts
+            tot = int(counts.sum())
+            if tot:
+                pt = np.repeat(np.arange(len(idx)), counts)
+                offs = np.arange(tot) - np.repeat(np.cumsum(counts) - counts, counts)
+                cand = self.cell_tris[np.repeat(starts, counts) + offs]
+                b = self._bary(cand, uv[idx][pt])
+                eps = 0.0001
+                ok = np.flatnonzero(np.all((b >= -eps) & (b <= 1 + eps), axis=1) & (self.area[cand] > 0.00001))
+                if len(ok):
+                    first_pt, first = np.unique(pt[ok], return_index=True)
+                    k = ok[first]
+                    tri[idx[first_pt]] = cand[k]
+                    bc[idx[first_pt]] = b[k]
+        for i in np.flatnonzero(tri < 0):
+            tri[i], bc[i] = self._closest(uv[i])
+        return tri, bc
+
+    def locate(self, p):
+        tri, bc = self.locate_all(np.asarray(p, dtype=float)[:2].reshape(1, 2))
+        return None if tri[0] < 0 else (int(tri[0]), bc[0])
+
     def map(self, uv):
         """Position and normal on the base mesh for each uv point."""
+        uv = np.asarray(uv, dtype=float)[:, :2]
+        tri, bc = self.locate_all(uv)
         n = len(uv)
         P = np.zeros((n, 3))
         N = np.zeros((n, 3))
-        for i in range(n):
-            res = self.locate(uv[i])
-            if res is None:
-                continue
-            t, bc = res
-            tri = self.tris[t]
-            P[i] = bc @ self.xyz[tri]
-            nn = bc @ self.nrm[tri]
-            ln = np.linalg.norm(nn)
-            N[i] = nn / ln if ln > 0 else nn
+        ok = tri >= 0
+        if np.any(ok):
+            V = self.tris[tri[ok]]
+            P[ok] = np.einsum('ij,ijk->ik', bc[ok], self.xyz[V])
+            nn = np.einsum('ij,ijk->ik', bc[ok], self.nrm[V])
+            ln = np.linalg.norm(nn, axis=1)
+            ln[ln == 0] = 1
+            N[ok] = nn / ln[:, None]
         return P, N
 
 
@@ -1863,9 +1947,11 @@ class Retopologizer:
 class _CornerTable:
     """Templates with a given number of corners, in the order of PatchDBInterface::querySelect."""
 
-    def __init__(self, conn, n_corners):
+    def __init__(self, conn, n_corners, indexed=True):
+        # the original reads the table through its index, which decides the order of templates whose sort keys tie
         cur = conn.execute(
-            'SELECT rowid, boundaryIDs, singularities, nSingularities, nConcaveCorners FROM Patches '
+            'SELECT rowid, boundaryIDs, singularities, nSingularities, nConcaveCorners FROM Patches ' +
+            ('INDEXED BY Patches_index ' if indexed else '') +
             'WHERE nCorners = ? ORDER BY nSingularities ASC, singularities ASC, nOccurrences DESC, nFaces ASC',
             (n_corners,))
         n_sides = n_corners if n_corners > 0 else 1
@@ -1928,6 +2014,8 @@ class PatchDB:
         except sqlite3.DatabaseError:
             self.conn.close()
             raise
+        self._indexed = self.conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'Patches_index'").fetchone()[0] > 0
         self._tables = {}
         self._templates = {}
 
@@ -1937,25 +2025,24 @@ class PatchDB:
     def table(self, n_corners):
         t = self._tables.get(n_corners)
         if t is None:
-            t = _CornerTable(self.conn, n_corners)
+            t = _CornerTable(self.conn, n_corners, self._indexed)
             self._tables[n_corners] = t
         return t
 
     def template(self, n_corners, index):
-        """The decoded template at `index` of the n_corners table (None if malformed)."""
+        """The template at `index` of the n_corners table (None if malformed).  Its mesh is decoded on first use."""
         key = (n_corners, index)
         t = self._templates.get(key, False)
         if t is not False:
             return t
-        if len(self._templates) > 50000:
-            self._templates.clear()
+        while len(self._templates) >= 4000:
+            del self._templates[next(iter(self._templates))]
         rowid = int(self.table(n_corners).rowids[index])
         row = self.conn.execute(
             'SELECT topology, boundaryIDs, singularities, nSingularities, nCorners, nFaces, nVertices, nOccurrences, '
             'nConcaveCorners FROM Patches WHERE rowid = ?', (rowid,)).fetchone()
         try:
             t = Template(index, row)
-            t.ensure_mesh()
         except (MalformedTemplate, ValueError, IndexError, TypeError):
             t = None
         self._templates[key] = t
@@ -1979,13 +2066,14 @@ def create_db(path, rows):
 
 # ---- the lookup (PatchPriorityLookup / MT_PatchPriorityLookup) ----------------------------------------------------
 class Result:
-    """A patch found by the lookup: a template with its rotation and polychord widths, expanded and placed."""
+    """A patch found by the lookup: a template with its rotation and polychord widths, and its scores.  The mesh is
+    kept only while the result is being made; Lookup.mesh_of() rebuilds it (with its placement) when needed."""
     __slots__ = ('template', 'rot', 'var', 'mesh', 'start', 'flow_distance', 'quality', 'boundary_len', 'perimeter')
 
     def default_key(self):
         t = self.template
-        return (t.n_sing, -t.n_occ, t.n_faces, t.n_vertices, t.n_corners, self.perimeter, tuple(self.boundary_len),
-                t.topology, tuple(tuple(s) for s in t.boundary_ids), self.rot, self.var)
+        return (t.n_sing, -t.n_occ, t.n_faces, t.n_vertices, t.n_corners, self.perimeter, self.boundary_len,
+                t.topology, t.key_ids(), self.rot, self.var)
 
     def sort_key(self, criteria):
         k = []
@@ -2021,6 +2109,7 @@ class Lookup:
         self.results = []
         self._keys = []
         self._unique = set()
+        self._meshes = collections.OrderedDict()
         self._phase = None
         self.n_templates = 0
 
@@ -2039,14 +2128,36 @@ class Lookup:
         self.results = []
         self._keys = []
         self._unique = set()
+        self._meshes = collections.OrderedDict()
+
+    def mesh_of(self, r):
+        """The expanded and placed mesh of a result, and its start corner (rebuilt on demand, a few kept)."""
+        key = id(r)
+        hit = self._meshes.get(key)
+        if hit is not None and hit[0] is r:
+            self._meshes.move_to_end(key)
+            return hit[1], hit[2]
+        m, start = r.template.expand(r.var, r.rot)
+        if self.geometrizer is not None:
+            tmp = Result()
+            tmp.template, tmp.rot, tmp.var, tmp.mesh, tmp.start = r.template, r.rot, r.var, m, start
+            tmp.flow_distance = tmp.quality = SCALAR_MAX
+            self.geometrizer.geometrize(tmp, self.flows)
+        self._meshes[key] = (r, m, start)
+        while len(self._meshes) > 16:
+            self._meshes.popitem(last=False)
+        return m, start
 
     def start(self, n_corners, boundary_length, flows=None, geometrizer=None):
         self.clear()
         self.n_corners = n_corners
         self.boundary_length = [int(x) for x in boundary_length]
+        self._boundary_tuple = tuple(self.boundary_length)
         self.perimeter = sum(self.boundary_length)
         self.flows = flows or {}
-        self.geometrizer = geometrizer
+        # a copy, so that results are rebuilt with the data and settings they were found with
+        self.geometrizer = copy.copy(geometrizer) if geometrizer is not None else None
+        self._meshes = collections.OrderedDict()
         # the settings in effect for this lookup (the original ignores changes while it runs)
         self._criteria = tuple(self.sort_criteria)
         self._max_sing = self.max_singularities
@@ -2076,22 +2187,10 @@ class Lookup:
             if self._phase == 'structure':
                 self._structure_filter()
                 self._ci = 0
-                self._phase = 'flows' if self.flows and self._cand else 'ilp'
-                if self._phase == 'flows':
-                    self._passed = []
-            elif self._phase == 'flows':
-                if self._ci >= len(self._cand):
-                    self._cand = self._passed
-                    self._ci = 0
-                    self._phase = 'ilp'
-                else:
-                    idx, rot = self._cand[self._ci]
-                    self._ci += 1
-                    if self._flow_filter(idx, rot):
-                        self._passed.append((idx, rot))
-                    else:
-                        self.n_templates -= 1
+                self._phase = 'ilp'
             elif self._phase == 'ilp':
+                # the original filters every candidate by the flows before solving any ILP; filtering each one just
+                # before its ILP keeps the same order of work, so the same results, and gives the first ones sooner
                 if self._sol_iter is None:
                     if self._ci >= len(self._cand):
                         self._phase = None
@@ -2100,11 +2199,15 @@ class Lookup:
                         break
                     idx, rot = self._cand[self._ci]
                     self._ci += 1
-                    self._sol_template = self.db.template(self.n_corners, idx) if self.db else None
-                    self._sol_rot = rot
-                    self._sol_iter = self._solutions(self._sol_template, rot) if self._sol_template else None
-                    if self._sol_iter is None:
+                    t = self.db.template(self.n_corners, idx) if self.db else None
+                    if t is None or (self.flows and not self._flow_filter(t, rot)):
                         self.n_templates -= 1
+                    else:
+                        self._sol_template = t
+                        self._sol_rot = rot
+                        self._sol_iter = self._solutions(t, rot)
+                        if self._sol_iter is None:
+                            self.n_templates -= 1
                 else:
                     var = next(self._sol_iter, None)
                     if var is None:
@@ -2153,22 +2256,24 @@ class Lookup:
         self._cand = list(zip(idx.tolist(), rot.tolist()))
         self.n_templates = len(self._cand)
 
-    def _flow_filter(self, idx, rot):
-        """flowFilterWorker."""
-        t = self.db.template(self.n_corners, idx)
-        if t is None:
-            return False
+    def _flow_filter(self, t, rot):
+        """flowFilterWorker: a polychord joining the sides of each border-to-border flow (read from the boundary ids)
+        and enough closed polychords for the closed flows (found in the template's mesh)."""
         ns = len(self.boundary_length)
+        corners = None
         try:
-            corners = corners_from_start(t.mesh, t.start)
             for key in sorted(self.flows):
                 if key[0] < ns and key[1] < ns:
                     ss = (key[0] + rot) % ns
                     es = (key[1] + rot) % ns
                     if not any(t.ends[b] == (ss, es) or t.ends[b] == (es, ss) for b in t.boundary_ids[ss]):
                         return False
-                elif len(find_polychords_with_topology(t.mesh, corners, key)) < len(self.flows[key]):
-                    return False
+                else:
+                    if corners is None:
+                        t.ensure_mesh()
+                        corners = corners_from_start(t.mesh, t.start)
+                    if len(find_polychords_with_topology(t.mesh, corners, key)) < len(self.flows[key]):
+                        return False
         except (MalformedTemplate, IndexError):
             return False
         return True
@@ -2225,7 +2330,7 @@ class Lookup:
         r.start = start
         r.flow_distance = SCALAR_MAX
         r.quality = SCALAR_MAX
-        r.boundary_len = self.boundary_length
+        r.boundary_len = self._boundary_tuple
         r.perimeter = self.perimeter
         if self.flows:
             try:
@@ -2250,11 +2355,15 @@ class Lookup:
         i = bisect.bisect_left(self._keys, key)
         self._keys.insert(i, key)
         self.results.insert(i, r)
+        # keep the placed meshes of the latest results only; the others are rebuilt when shown
+        self._meshes[id(r)] = (r, m, start)
+        while len(self._meshes) > 16:
+            self._meshes.popitem(last=False)
+        r.mesh = r.start = None
 
 
-def build_patch(r, patch):
-    """convert_patch: replaces the content of a curvenetwork patch with a lookup result."""
-    m = r.mesh
+def build_patch(m, start, patch):
+    """convert_patch: replaces the content of a curvenetwork patch with a placed lookup result."""
     patch.clear()
     for v in range(m.nv):
         patch.add_vertex(np.concatenate((m.P[v], m.N[v])))
@@ -2277,7 +2386,7 @@ def build_patch(r, patch):
         if patch.add_face(list(m.fv[f])) < 0:
             patch.clear()
             return False
-    h = patch.halfedge_handle(r.start.v)
+    h = patch.halfedge_handle(start.v)
     num_subdiv = patch.num_subdiv_all()
     for i, ns in enumerate(num_subdiv):
         patch.v_corner[patch.from_vertex_handle(h)] = i
@@ -2384,7 +2493,8 @@ class LearnQuad:
     def convert_result(self, index, patch):
         if index < 0 or index >= self.lookup.num_results():
             return False
-        return build_patch(self.lookup.results[index], patch)
+        m, start = self.lookup.mesh_of(self.lookup.results[index])
+        return build_patch(m, start, patch)
 
     # -- SketchRetopo::generate_patch for more than 6 corners --
     def generate_patch(self, engine, patch, num_subdiv, time_limit=10.0):
@@ -2405,4 +2515,5 @@ class LearnQuad:
                 break
         if lk.num_results() == 0:
             return False
-        return build_patch(lk.results[0], patch)
+        m, start = lk.mesh_of(lk.results[0])
+        return build_patch(m, start, patch)

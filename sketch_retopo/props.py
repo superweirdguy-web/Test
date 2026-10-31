@@ -223,7 +223,7 @@ def _mesh_poll(self, obj):
 
 SORT_ITEMS = [('FLOW', 'By Flow', 'Sort by distance to the flow strokes, then singularities, then quad quality'),
               ('QUALITY', 'By Quality', 'Sort by quad quality, then singularities, then flow distance'),
-              ('NUMSING', 'By Singularities', 'Sort by number and type of singularities, then flow distance')]
+              ('NUMSING', 'By Singularities', 'Sort by number and type of irregular vertices, then flow distance')]
 
 
 def apply_query_settings(eng, st=None):

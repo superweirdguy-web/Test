@@ -271,4 +271,5 @@ def main():
     bpy.app.timers.register(tick, first_interval=1.0)
 
 
-main()
+if __name__ == '__main__':
+    main()

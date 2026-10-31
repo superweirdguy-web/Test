@@ -1344,6 +1344,7 @@ class StateQueryDB(State):
         """StateQueryDB::enter_state."""
         self.core.learnquad.stop()
         self.querydata = QueryData()
+        self.stroke_display = []   # the flow strokes projected onto the surface, for drawing only
         self.lookup_index = -1
         self.selected_patch = None
         self.current_stroke = Polyline()
@@ -1430,6 +1431,8 @@ class StateQueryDB(State):
         lq = self.core.learnquad
         lq.stop()
         self.querydata.strokes.pop()
+        if self.stroke_display:
+            self.stroke_display.pop()
         self.status = 'idle'
         lq.send_strokes(self.querydata)
 
@@ -1446,11 +1449,12 @@ class StateQueryDB(State):
         p = self.selected_patch
         if p is not None and not p.is_deleted:
             drawer.patch_fill(p, cr.color_active + (cr.color_patch_alpha,))
-            for pts, _, is_loop in self.querydata.strokes:
+            # (the strokes the lookup uses are smoothed like the original's and can dip below a curved surface)
+            for pts, is_loop in self.stroke_display:
                 strip = list(pts) + ([pts[0]] if is_loop and len(pts) else [])
-                drawer.line_strip(strip, cr.color_active, 1)
+                drawer.line_strip(strip, cr.color_active, 2)
             if self.current_stroke.size() >= 2:
-                drawer.line_strip(_curve_points(self.current_stroke), cr.color_active, 1)
+                drawer.line_strip(_curve_points(self.current_stroke), cr.color_active, 2)
         if self.status_msg:
             drawer.screen_text(self.status_msg)
 
@@ -1491,6 +1495,7 @@ class StateQueryDB(State):
             lq.stop()
             self.selected_patch = best
             self.querydata = QueryData()
+            self.stroke_display = []
             self.lookup_index = -1
             self.status = 'idle'
             self.update_status_msg()
@@ -1528,6 +1533,7 @@ class StateQueryDB(State):
             return
         if not shift:
             self.querydata.strokes = []
+            self.stroke_display = []
         # start a flow stroke inside the patch
         if self._face_in_region(core.common_pn_mouse) is None:
             return
@@ -1556,7 +1562,7 @@ class StateQueryDB(State):
                 lq.stop()
             return
         bm = core.basemesh
-        pts, uvs = [], []
+        pts, uvs, shown = [], [], []
         for pn in stroke.points:
             hit = self._face_in_region(pn)
             if hit is None:
@@ -1566,10 +1572,12 @@ class StateQueryDB(State):
                   hit.v * self.basemesh_uv[c])
             pts.append(np.asarray(pn[:3], dtype=float))
             uvs.append(uv)
+            shown.append(core.project(np.array(pn, dtype=float))[:3])
         self.current_stroke = Polyline()
         if len(pts) < 2:
             return
         self.querydata.strokes.append((np.array(pts), np.array(uvs), stroke.is_loop))
+        self.stroke_display.append((np.array(shown), stroke.is_loop))
         if not lq.is_loaded():
             core.report('No patch database loaded (SketchRetopo sidebar > Query Database)', 'WARNING')
             return

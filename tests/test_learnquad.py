@@ -132,14 +132,73 @@ def test_lookup_side_lengths():
         assert lk.status == 'complete'
         hashes = set()
         for r in lk.results:
-            assert side_lengths(r.mesh, r.start) == L
-            hashes.add(lq.build_topology_str(r.mesh, r.start))
+            m, start = lk.mesh_of(r)
+            assert side_lengths(m, start) == L
+            hashes.add(lq.build_topology_str(m, start))
         assert len(hashes) == lk.num_results()
         keys = [r.sort_key(lk.sort_criteria) for r in lk.results]
         assert keys == sorted(keys)
         print(L, 'results', lk.num_results())
         if len(L) >= 7:
             assert lk.num_results() > 0
+
+
+def test_expanded_topology_matches_mesh():
+    """The uniqueness key computed from the expansion's adjacency equals the string of the expanded mesh."""
+    db = lq.PatchDB(DB_PATH)
+    lk = lq.Lookup(db)
+    lk.start(4, [6, 4, 6, 4])
+    lk.run()
+    for r in lk.results:
+        ex, (cell, z, v, d) = r.template.expand_adjacency(r.var, r.rot)
+        assert lq._topology_str_adj(ex.ffp, ex.ffi, cell, z, d) == lq.build_topology_str(*lk.mesh_of(r))
+
+
+def test_uv_locator_and_solver():
+    rng = np.random.default_rng(3)
+    V, T = grid_mesh(30, 2.0)
+    uv = V[:, :2] + 0.01 * rng.standard_normal((len(V), 2))
+    nrm = np.tile((0.0, 0.0, 1.0), (len(V), 1))
+    loc = lq.UVLocator(V, nrm, uv, T)
+    pts = rng.uniform(-1.2, 1.2, (300, 2))
+    tri, bc = loc.locate_all(pts)
+    for p, t, b in zip(pts, tri, bc):
+        # the first triangle of the point's grid cell that contains it, as UVGrid; else the closest one
+        res = None
+        if np.all(p >= loc.lo) and np.all(p <= loc.hi):
+            c = np.clip(np.floor((p - loc.lo) / loc.edge).astype(int), 0, loc.size - 1)
+            cid = c[0] * loc.size + c[1]
+            for cand in loc.cell_tris[loc.cell_ptr[cid]:loc.cell_ptr[cid + 1]]:
+                bb = loc._bary(np.array([cand]), p)[0]
+                if np.all((bb >= -1e-4) & (bb <= 1 + 1e-4)) and loc.area[cand] > 1e-5:
+                    res = (cand, bb)
+                    break
+        if res is None:
+            res = loc._closest(p)
+        assert res[0] == t and np.allclose(res[1], b)
+    # conjugate gradients agree with the dense solve
+    lk = lq.Lookup(lq.PatchDB(DB_PATH))
+    lk.start(4, [4, 4, 6, 6])
+    lk.run()
+    m = lk.mesh_of(lk.results[-1])[0]
+    m.P = rng.random((m.nv, 3))
+    border = m.border_vertices()
+    rows, cols, vals = lq._laplacian_triplets(m, lq.SMOOTH_LAMBDA)
+    b = np.flatnonzero(border)
+    rows, cols, vals = (np.concatenate(rows + [b]), np.concatenate(cols + [b]),
+                        np.concatenate(vals + [np.full(len(b), lq.PENALTY)]))
+    rhs = np.zeros((m.nv, 3))
+    rhs[b] = lq.PENALTY * m.P[b]
+    saved = lq.DENSE_SOLVE_MAX
+    try:
+        lq.DENSE_SOLVE_MAX = 10 ** 9
+        dense = lq._solve_spd(rows, cols, vals, m.nv, rhs)
+        lq.DENSE_SOLVE_MAX = 0
+        cg = lq._solve_spd(rows, cols, vals, m.nv, rhs)
+    finally:
+        lq.DENSE_SOLVE_MAX = saved
+    print('solver: n', m.nv, 'max difference dense/cg %.1e' % np.abs(dense - cg).max())
+    assert np.abs(dense - cg).max() < 1e-8
 
 
 def _square(eng, h=0.5):
@@ -189,7 +248,7 @@ def test_query_database_mode():
     assert patch.num_subdiv_all() == ns
     corners = sorted(patch.v_corner[v] for v in patch.vertices() if patch.v_corner[v] >= 0)
     assert corners == [0, 1, 2, 3]
-    assert patch.n_faces() == res[0].mesh.nf
+    assert patch.n_faces() == eng.learnquad.lookup.mesh_of(res[0])[0].nf
     for v in patch.vertices():
         p = patch.pn[v][:3]
         assert abs(p[0]) <= 0.52 and abs(p[1]) <= 0.52
@@ -258,7 +317,8 @@ def test_generate_patch_more_than_6_corners():
 
 
 if __name__ == '__main__':
-    for fn in (test_encode_decode_roundtrip, test_enumerate_ilp, test_lookup_side_lengths, test_query_database_mode,
+    for fn in (test_encode_decode_roundtrip, test_enumerate_ilp, test_lookup_side_lengths,
+               test_expanded_topology_matches_mesh, test_uv_locator_and_solver, test_query_database_mode,
                test_generate_patch_more_than_6_corners):
         t0 = time.time()
         print('==', fn.__name__)

@@ -115,8 +115,15 @@ and Blender's own shortcuts apply again.
 SketchRetopo2 fills loops of 2–6 corners from built-in patterns. For the query database mode (`S`), and for
 loops with more corners (hold `X` and drag into the region), it looks layouts up in a database of patches
 learned from artist-made quad meshes: `patches.db`, from
-<https://github.com/kenshi84/files/releases/tag/sketch-retopo>. (The *huge* version comes in two parts:
-`cat patches.huge.db.0 patches.huge.db.1 > patches.db`.)
+<https://github.com/kenshi84/files/releases/tag/sketch-retopo>. The *huge* version comes in two parts that are
+joined into one file: on Windows, in a Command Prompt in the download folder,
+`copy /b patches.huge.db.0 + patches.huge.db.1 patches.db`; on macOS or Linux,
+`cat patches.huge.db.0 patches.huge.db.1 > patches.db`.
+
+The two files complement each other. `patches.db` (174,000 templates, 740 MB) has more 4- to 8-sided layouts;
+its templates with 9 or more corners are tiny, so it rarely fills such loops. The huge file (431,000 templates,
+2.6 GB) has fewer 4-sided layouts but covers loops of up to 34 corners, so use it if you fill regions with many
+corners.
 
 * Set the file in the add-on preferences (*Patch Database*), or use **Load Patch Database** in the
   sidebar's *Query Database* panel. Like the demo, a `patches.db` in your home folder is also picked up.
@@ -128,6 +135,12 @@ learned from artist-made quad meshes: `patches.db`, from
   sort order (by flow, by quality, by singularities), and **Stop**, **Restart** and **Delete Flow**.
 * The lookup runs in the background while you work; the best result so far is shown in the patch and the
   status is displayed at the top of the viewport. Settings take effect at the next lookup (Restart).
+* Results appear within a second or two. A big boundary can match a very large number of layouts (a 12/8/12/8
+  patch with one flow stroke finds about 105,000), and the full lookup then takes minutes, as in the original;
+  Stop keeps what has been found.
+* A flow stroke has to be followable: each result has a polychord that starts and ends within *Flow Tolerance*
+  edges of the stroke's ends, so a stroke that crosses a regular patch at a steep angle finds layouts with
+  irregular vertices that bend the edge flow.
 
 ## Files
 
@@ -163,11 +176,14 @@ The behavior follows the C++ source; these parts necessarily differ:
   admit no pattern, or a laser plane passing exactly through mesh vertices) are handled gracefully.
 * **Patch database lookup.** The original runs the lookup on worker threads with the SCIP solver; this port
   runs it incrementally in Blender's event loop with its own exact enumeration of the integer solutions. It was
-  checked against the original C++ lookup compiled from the demo's source: the same patches are found, in the
-  same order, and placed identically. Two corner cases can differ: when two polychord widths give the very same
-  mesh, the original keeps whichever SCIP happens to list first (the mesh is identical), and on perfectly
-  regular grids with flow strokes the original's placement depends on rounding noise. Python is slower than
-  the original's C++, so large boundaries take longer to complete (results appear as they are found).
+  checked against the original C++ lookup, compiled from the demo's source, on both real databases: every
+  template decodes identically, and the same patches are found, in the same order (as the original run on one
+  thread: with several threads it keeps an arbitrary one of two rotations of a symmetric template that give the
+  same mesh), and placed identically (to about 1e-12). The exception is the placement along flow strokes of
+  layouts with exactly or nearly parallelogram-shaped quads in the parameter domain, about 1% of the results:
+  there the original's bilinear-coordinate formula is numerically unstable and its output depends on rounding
+  noise, so it cannot be reproduced. Being free of SCIP's overhead, the lookup needs about a third of the
+  original's CPU time; it runs on one core, so the original on four or more cores finishes big lookups sooner.
 * **Sizes on screen.** The snapping radius, brushes and corner markers scale with the view as in the
   original (whose camera has a 40° field of view), so they look the same size on screen.
 
@@ -197,6 +213,9 @@ keyboard events and saves screenshots (Linux, needs `xvfb-run` and ImageMagick):
 ```
 xvfb-run -a -s "-screen 0 1600x1000x24" blender --enable-event-simulate --python tests/gui_test.py -- /tmp/gui
 ```
+
+`tests/gui_test_querydb.py` does the same for the query database mode with a real database (pass its path
+after the output folder); it also saves animation frames.
 
 ## License and credits
 

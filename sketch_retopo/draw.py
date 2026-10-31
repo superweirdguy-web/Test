@@ -719,7 +719,12 @@ class Renderer:
                 blf.position(font_id, float(x) - w / 2, float(y) - h / 2, 0)
                 blf.draw(font_id, text)
             blf.disable(font_id, blf.SHADOW)
-        y = region.height - 30
+        # status texts at the top center, below the header bars when they overlap the viewport
+        top = region.height
+        for other in context.area.regions:
+            if other.type in ('HEADER', 'TOOL_HEADER') and other.height > 1 and region.y < other.y < region.y + region.height:
+                top = min(top, other.y - region.y)
+        y = top - 30
         for text, color in self.screen_texts:
             blf.size(font_id, 18)
             for line in text.split('\n'):

@@ -180,16 +180,18 @@ class SKETCHRETOPO_PT_query_db(bpy.types.Panel):
         for p in ('qdb_max_numsing', 'qdb_max_concave', 'qdb_min_valence', 'qdb_max_valence'):
             col.prop(st, p)
         col = layout.column(align=True)
-        row = col.row(align=True)
-        row.prop(st, 'qdb_ilp_flow', toggle=True)
-        row.prop(st, 'qdb_ilp_flow_tlrnc', text='Tolerance')
+        col.prop(st, 'qdb_ilp_flow')
+        sub = col.row(align=True)
+        sub.active = st.qdb_ilp_flow
+        sub.prop(st, 'qdb_ilp_flow_tlrnc', text='Flow Tolerance')
         col.prop(st, 'qdb_quality_th')
         col.prop(st, 'qdb_laplace_w')
-        layout.row(align=True).prop(st, 'qdb_sort', expand=True)
-        row = layout.row(align=True)
+        layout.prop(st, 'qdb_sort', text='Sort')
+        col = layout.column(align=True)
+        row = col.row(align=True)
         row.operator('sketch_retopo.query_stop', icon='PAUSE')
         row.operator('sketch_retopo.query_restart', icon='FILE_REFRESH')
-        row.operator('sketch_retopo.query_delete_flow', icon='X')
+        col.operator('sketch_retopo.query_delete_flow', icon='X')
 
 
 class SKETCHRETOPO_PT_config(bpy.types.Panel):
