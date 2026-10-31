@@ -183,8 +183,9 @@ The behavior follows the C++ source; these parts necessarily differ:
   layouts with exactly or nearly parallelogram-shaped quads in the parameter domain (1–6% of the results in the
   tests):
   there the original's bilinear-coordinate formula is numerically unstable and its output depends on rounding
-  noise, so it cannot be reproduced. Being free of SCIP's overhead, the lookup needs about a third of the
-  original's CPU time; it runs on one core, so the original on four or more cores finishes big lookups sooner.
+  noise, so it cannot be reproduced. The lookup needs a fifth to a half of the original's CPU time on small and
+  medium patches (SCIP is slow on the many small problems) and about the same on very large patches; it runs
+  on one core, so on large patches the original, running on several cores, finishes sooner.
 * **Sizes on screen.** The snapping radius, brushes and corner markers scale with the view as in the
   original (whose camera has a 40° field of view), so they look the same size on screen.
 

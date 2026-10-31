@@ -149,9 +149,50 @@ def test_expanded_topology_matches_mesh():
     lk = lq.Lookup(db)
     lk.start(4, [6, 4, 6, 4])
     lk.run()
+    strings = {}
     for r in lk.results:
         ex, (cell, z, v, d) = r.template.expand_adjacency(r.var, r.rot)
-        assert lq._topology_str_adj(ex.ffp, ex.ffi, cell, z, d) == lq.build_topology_str(*lk.mesh_of(r))
+        s = lq._topology_str_adj(ex.ffp, ex.ffi, cell, z, d)
+        assert s == lq.build_topology_str(*lk.mesh_of(r))
+        strings[lq._topology_key_adj(ex.ffp, ex.ffi, cell, z, d)] = s
+    assert len(strings) == len(set(strings.values())) == lk.num_results()
+
+
+def _polychord_points_reference(start, P):
+    """PolychordPoints::polychordToPoints written with Pos, as in the original."""
+    run = start.copy()
+    pts = []
+    while True:
+        pts.append((P[run.v] + P[run.vflip()]) / 2.0)
+        run.flip_e()
+        run.flip_v()
+        run.flip_e()
+        pts.append((pts[-1] + (P[run.v] + P[run.vflip()]) / 2.0) / 2.0)
+        run.flip_f()
+        if run == start or run.is_border():
+            break
+    pts.append((P[run.v] + P[run.vflip()]) / 2.0)
+    return np.array(pts)
+
+
+def test_polychord_points():
+    rng = np.random.default_rng(5)
+    lk = lq.Lookup(lq.PatchDB(DB_PATH))
+    lk.start(4, [4, 4, 6, 6])
+    lk.run()
+    n = 0
+    for r in lk.results:
+        m, start = lk.mesh_of(r)
+        P = rng.random((m.nv, 3))
+        positions = [lq.Pos(m, f, zz, m.fv[f][zz]) for f in range(m.nf) for zz in range(4)]
+        positions += [lq.Pos(m, f, zz, m.fv[f][(zz + 1) & 3]) for f in range(m.nf) for zz in range(4)]
+        for pos in positions:
+            pp = lq.PolychordPoints()
+            pp.start = pos
+            pp.polychord_to_points(P)
+            assert np.array_equal(pp.points, _polychord_points_reference(pos, P))
+            n += 1
+    print('polychords compared', n)
 
 
 def test_uv_locator_and_solver():
@@ -318,7 +359,8 @@ def test_generate_patch_more_than_6_corners():
 
 if __name__ == '__main__':
     for fn in (test_encode_decode_roundtrip, test_enumerate_ilp, test_lookup_side_lengths,
-               test_expanded_topology_matches_mesh, test_uv_locator_and_solver, test_query_database_mode,
+               test_expanded_topology_matches_mesh, test_polychord_points, test_uv_locator_and_solver,
+               test_query_database_mode,
                test_generate_patch_more_than_6_corners):
         t0 = time.time()
         print('==', fn.__name__)

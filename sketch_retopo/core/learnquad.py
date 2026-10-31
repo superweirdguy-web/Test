@@ -674,6 +674,33 @@ class Template:
         return m, Pos(m, cell, z, v)
 
 
+def _topology_key_adj(ffp, ffi, f0, z0, d):
+    """A hash of what _topology_str_adj encodes (the same face ids in the same order), without the string."""
+    ids = [-1] * len(ffp)
+    order = [(f0, z0)]
+    ids[f0] = 0
+    cur_id = 0
+    qi = 0
+    while qi < len(order):
+        f, z = order[qi]
+        qi += 1
+        pf = ffp[f]
+        for k in range(4):
+            e = (z + d * k) & 3
+            g = pf[e]
+            if g != f and ids[g] < 0:
+                cur_id += 1
+                ids[g] = cur_id
+                order.append((g, ffi[f][e]))
+    seq = []
+    for f, z in order:
+        pf = ffp[f]
+        for k in (1, 2, 3):
+            g = pf[(z + d * k) & 3]
+            seq.append(-1 if g == f else ids[g])
+    return hash(tuple(seq))
+
+
 def _topology_str_adj(ffp, ffi, f0, z0, d):
     """build_topology_str for a consistently oriented mesh given by its face adjacency only."""
     ids = [-1] * len(ffp)
@@ -1235,21 +1262,37 @@ class PolychordPoints(FlowPoints):
         self.distances = None
 
     def polychord_to_points(self, P):
-        run = self.start.copy()
-        pts = []
-        g = _Guard(2 * run.m.nf + 4)
+        """PolychordPoints::polychordToPoints: the midpoint of each edge crossed, with the midpoint between the two
+        edges of each face in between.  (The walk is the Pos walk FlipE FlipV FlipE FlipF, done on integers.)"""
+        m = self.start.m
+        fv, ffp, ffi = m.fv, m.ffp, m.ffi
+        f0, z0, v0 = self.start.f, self.start.z, self.start.v
+        f, z, v = f0, z0, v0
+        entry = []
+        exit_ = []
+        g = _Guard(2 * m.nf + 4)
         while True:
             g()
-            pts.append((P[run.v] + P[run.vflip()]) / 2.0)
-            run.flip_e()
-            run.flip_v()
-            run.flip_e()
-            pts.append((pts[-1] + (P[run.v] + P[run.vflip()]) / 2.0) / 2.0)
-            run.flip_f()
-            if run == self.start or run.is_border():
+            fz = fv[f]
+            entry.append((fz[z], fz[(z + 1) & 3]))
+            z1 = (z + 1) & 3 if fz[(z + 1) & 3] == v else (z + 3) & 3        # FlipE
+            v = fz[z1] if fz[(z1 + 1) & 3] == v else fz[(z1 + 1) & 3]        # FlipV
+            z = (z1 + 1) & 3 if fz[(z1 + 1) & 3] == v else (z1 + 3) & 3      # FlipE
+            exit_.append((fz[z], fz[(z + 1) & 3]))
+            f, z = ffp[f][z], ffi[f][z]                                       # FlipF
+            if (f == f0 and z == z0 and v == v0) or ffp[f][z] == f:
                 break
-        pts.append((P[run.v] + P[run.vflip()]) / 2.0)
-        self.points = np.array(pts)
+        fz = fv[f]
+        last = (P[fz[z]] + P[fz[(z + 1) & 3]]) / 2.0
+        a = np.array(entry)
+        b = np.array(exit_)
+        mids = (P[a[:, 0]] + P[a[:, 1]]) / 2.0
+        centers = (mids + (P[b[:, 0]] + P[b[:, 1]]) / 2.0) / 2.0
+        pts = np.empty((2 * len(a) + 1, 3))
+        pts[0:-1:2] = mids
+        pts[1:-1:2] = centers
+        pts[-1] = last
+        self.points = pts
         self.update_arc()
 
 
@@ -1455,7 +1498,7 @@ DENSE_SOLVE_MAX = 128    # larger systems use conjugate gradients (faster there,
 
 def _solve_spd(rows, cols, vals, n, rhs, tol=1e-14):
     """Solves a symmetric positive definite system given as triplets (duplicates summed): dense for small systems,
-    Jacobi-preconditioned conjugate gradients (one column per coordinate) otherwise."""
+    otherwise Jacobi-preconditioned conjugate gradients on the coordinates stacked into one block-diagonal system."""
     rhs = np.asarray(rhs, dtype=float)
     out = np.zeros_like(rhs)
     if n == 0:
@@ -1474,31 +1517,37 @@ def _solve_spd(rows, cols, vals, n, rhs, tol=1e-14):
     on = r_ == c_
     diag = np.bincount(r_[on], weights=v[on], minlength=n)
     diag[np.abs(diag) < 1e-300] = 1.0
-    for j in range(rhs.shape[1]):
-        b = rhs[:, j]
-        bnorm = float(np.sqrt(b @ b))
-        if bnorm == 0:
-            continue
-        x = b / diag
-        r = b - np.bincount(r_, weights=v * x[c_], minlength=n)
-        z = r / diag
-        p = z.copy()
-        rz = float(r @ z)
-        for _ in range(20 * n):
-            Ap = np.bincount(r_, weights=v * p[c_], minlength=n)
-            pAp = float(p @ Ap)
-            if pAp <= 0:
-                break
-            alpha = rz / pAp
-            x += alpha * p
-            r -= alpha * Ap
-            if float(np.sqrt(r @ r)) <= tol * bnorm:
-                break
-            z = r / diag
-            rz_new = float(r @ z)
-            p = z + (rz_new / rz) * p
-            rz = rz_new
-        out[:, j] = x
+    cols_ = [j for j in range(rhs.shape[1]) if np.any(rhs[:, j] != 0)]
+    k = len(cols_)
+    if k == 0:
+        return out
+    R = np.concatenate([r_ + i * n for i in range(k)])
+    C = np.concatenate([c_ + i * n for i in range(k)])
+    V = np.tile(v, k)
+    D = np.tile(diag, k)
+    N = k * n
+    b = rhs[:, cols_].T.reshape(-1)
+    bnorm = float(np.sqrt(b @ b))
+    x = b / D
+    r = b - np.bincount(R, weights=V * x[C], minlength=N)
+    z = r / D
+    p = z.copy()
+    rz = float(r @ z)
+    for _ in range(20 * N):
+        if float(np.sqrt(r @ r)) <= tol * bnorm:
+            break
+        Ap = np.bincount(R, weights=V * p[C], minlength=N)
+        pAp = float(p @ Ap)
+        if pAp <= 0:
+            break
+        alpha = rz / pAp
+        x += alpha * p
+        r -= alpha * Ap
+        z = r / D
+        rz_new = float(r @ z)
+        p = z + (rz_new / rz) * p
+        rz = rz_new
+    out[:, cols_] = x.reshape(k, n).T
     return out
 
 
@@ -2315,7 +2364,7 @@ class Lookup:
         registered once the flow check passed, as in the original.)"""
         try:
             ex, (cell, z, v, d) = t.expand_adjacency(var, rot)
-            h = hash(_topology_str_adj(ex.ffp, ex.ffi, cell, z, d))
+            h = _topology_key_adj(ex.ffp, ex.ffi, cell, z, d)
             if h in self._unique:
                 return
             m = ex.mesh()
